@@ -1,0 +1,74 @@
+# Environment variables
+.env
+
+# Data directories
+data/
+datasets/
+
+# Model checkpoints and outputs
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+wandb/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# TensorFlow
+*.tfrecord
+tensorflow_datasets/
+
+# HuggingFace cache
+.cache/

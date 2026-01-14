@@ -1,0 +1,36 @@
+# GRPO (Group Relative Policy Optimization) Configuration
+# =======================================================
+
+# Model
+model_path: "checkpoints/sft/best_model"  # Start from SFT checkpoint
+model_name: "google/medgemma-4b-it"
+
+# GRPO Parameters
+num_generations: 4      # Number of responses to generate per sample
+max_new_tokens: 128     # Maximum tokens to generate
+temperature: 0.8        # Sampling temperature
+reward_metric: "cider"  # Options: cider, bleu, rouge
+kl_coef: 0.1           # KL divergence penalty coefficient
+clip_range: 0.2        # PPO-style clipping range
+
+# Training
+batch_size: 2
+gradient_accumulation_steps: 8  # Effective batch size = 16
+num_epochs: 1
+num_steps: 500          # Total training steps
+learning_rate: 5.0e-6   # Lower LR for RL fine-tuning
+warmup_steps: 50
+max_seq_length: 512
+
+# Data
+data_path: "data/processed"
+
+# Output
+output_dir: "checkpoints/grpo"
+
+# Quantization
+use_4bit: true
+
+# Misc
+seed: 42
+use_wandb: true

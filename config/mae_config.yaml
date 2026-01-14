@@ -1,0 +1,40 @@
+# MAE Pretraining Configuration
+# ==============================
+
+# Data
+data_path: "data/processed"
+target_length: 10  # 10 seconds at 1Hz
+
+# Model Architecture
+input_dim: 128      # AudioSet VGGish feature dimension
+encoder_dim: 512    # Transformer encoder hidden dimension
+encoder_layers: 6   # Number of encoder layers
+encoder_heads: 8    # Number of attention heads
+decoder_dim: 256    # Decoder hidden dimension
+decoder_layers: 2   # Number of decoder layers
+decoder_heads: 4    # Number of decoder attention heads
+dropout: 0.1
+
+# MAE Parameters
+mask_ratio: 0.75    # Ratio of patches to mask (75% recommended)
+
+# Training
+batch_size: 64
+num_epochs: 100
+learning_rate: 1.0e-4
+min_lr: 1.0e-6
+weight_decay: 0.05
+grad_accum_steps: 1
+num_workers: 4
+
+# Optimizer (AdamW)
+betas: [0.9, 0.95]
+
+# Output
+output_dir: "checkpoints/mae"
+log_dir: "logs"
+save_every: 10
+
+# Logging
+use_wandb: true
+run_name: null  # Auto-generated if not provided
