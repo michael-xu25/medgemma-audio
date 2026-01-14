@@ -46,6 +46,7 @@ def install_packages():
         "tqdm",
         "requests",
         "tensorflow",
+        "tf-keras",  # Required for Keras 3 compatibility
         "wandb",
         "nltk",
     ]
