@@ -494,20 +494,15 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
         prompt = f"<start_of_turn>user\nDescribe this audio.<end_of_turn>\n<start_of_turn>model\n{sample['caption']}<end_of_turn>"
         prompts.append(prompt)
     
-    # Simple training
-    from transformers import TrainingArguments, Trainer
+    # Use SFTTrainer from TRL (designed for this)
+    from trl import SFTTrainer, SFTConfig
     from datasets import Dataset
     
     dataset = Dataset.from_dict({"text": prompts})
     
-    def tokenize(examples):
-        return tokenizer(examples["text"], truncation=True, padding=True, max_length=512)
-    
-    dataset = dataset.map(tokenize, batched=True)
-    
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
-    args = TrainingArguments(
+    sft_config = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
@@ -515,9 +510,17 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
         logging_steps=10,
         save_steps=500,
         report_to="none",
+        dataset_text_field="text",
+        max_seq_length=512,
+        packing=False,
     )
     
-    trainer = Trainer(model=model, args=args, train_dataset=dataset, tokenizer=tokenizer)
+    trainer = SFTTrainer(
+        model=model,
+        args=sft_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+    )
     trainer.train()
     
     model.save_pretrained(f"{output_dir}/final_model")
