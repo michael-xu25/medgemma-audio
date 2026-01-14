@@ -4,6 +4,14 @@
 
 set -e
 
+# Get script directory and project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Add project root to Python path
+export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
+cd "$PROJECT_ROOT"
+
 # Configuration
 AUDIOSET_DIR="data/audioset"
 AUDIOCAPS_DIR="data/audiocaps"

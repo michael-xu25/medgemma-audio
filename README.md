@@ -26,13 +26,18 @@ python -m venv venv
 source venv/bin/activate  # Linux/Mac
 # or: venv\Scripts\activate  # Windows
 
-# Install dependencies
+# Install the package (recommended)
+pip install -e .
+
+# Or install dependencies directly
 pip install -r requirements.txt
 
 # Setup environment variables
 cp env.template .env
 # Edit .env and add your HuggingFace token
 ```
+
+**Note:** Installing with `pip install -e .` makes the `src` module available system-wide. Alternatively, the scripts automatically set `PYTHONPATH`.
 
 ### 2. Download Data
 
