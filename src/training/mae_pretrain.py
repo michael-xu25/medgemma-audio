@@ -3,6 +3,12 @@ Masked Autoencoder (MAE) pretraining for audio encoder.
 """
 
 import os
+import sys
+
+# Add project root to path
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _project_root)
+
 import argparse
 import yaml
 import torch
@@ -13,9 +19,6 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
 from typing import Dict, Optional
-
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.models.audio_encoder import AudioMAE
 from src.data.dataset import MAEAudioDataset

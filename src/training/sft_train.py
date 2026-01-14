@@ -5,6 +5,12 @@ Based on: https://colab.research.google.com/github/unslothai/notebooks/blob/main
 """
 
 import os
+import sys
+
+# Add project root to path
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _project_root)
+
 import argparse
 import yaml
 import torch
@@ -12,9 +18,6 @@ from pathlib import Path
 from typing import Dict, Optional, List
 from dataclasses import dataclass
 from dotenv import load_dotenv
-
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Load environment variables
 load_dotenv()
