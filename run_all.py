@@ -830,9 +830,16 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
             def __init__(self, input_dim=128, hidden_dim=256, num_layers=4, num_heads=4, max_len=64):
                 super().__init__()
                 self.hidden_dim = hidden_dim
-                self.patch_embed = nn.Linear(input_dim, hidden_dim)
-                self.pos_embed = nn.Parameter(torch.randn(1, max_len, hidden_dim) * 0.02)
-                self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+                # AudioMAE style: Linear + LayerNorm
+                self.patch_embed = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim)
+                )
+                # +1 for CLS token position
+                self.pos_embed = nn.Parameter(torch.zeros(1, max_len + 1, hidden_dim))
+                self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+                nn.init.trunc_normal_(self.pos_embed, std=0.02)
+                nn.init.trunc_normal_(self.cls_token, std=0.02)
                 
                 encoder_layer = nn.TransformerEncoderLayer(
                     d_model=hidden_dim, nhead=num_heads,
@@ -845,9 +852,11 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
             def forward(self, x):
                 B, T, D = x.shape
                 x = self.patch_embed(x)
-                x = x + self.pos_embed[:, :T, :]
+                # Add CLS token
                 cls_tokens = self.cls_token.expand(B, -1, -1)
                 x = torch.cat([cls_tokens, x], dim=1)
+                # Add positional embeddings (first position is CLS)
+                x = x + self.pos_embed[:, :T+1, :]
                 x = self.encoder(x)
                 x = self.norm(x)
                 return x[:, 0]  # Return CLS token
@@ -858,17 +867,38 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
         checkpoint = torch.load(mae_checkpoint, map_location=device)
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         
-        # Filter to encoder weights only
+        # Filter to encoder weights only, handling old/new formats
         encoder_state = {}
+        is_old_format = 'patch_embed.weight' in state_dict
+        
         for k, v in state_dict.items():
             if k.startswith('patch_embed') or k.startswith('pos_embed') or \
                k.startswith('cls_token') or k.startswith('encoder') or k.startswith('encoder_norm'):
                 new_k = k.replace('encoder_norm', 'norm')
+                
+                # Handle old checkpoint format
+                if is_old_format:
+                    if k == 'patch_embed.weight':
+                        new_k = 'patch_embed.0.weight'
+                    elif k == 'patch_embed.bias':
+                        new_k = 'patch_embed.0.bias'
+                    elif k == 'pos_embed':
+                        # Old format: (1, max_len, dim), new format: (1, max_len+1, dim)
+                        v = torch.cat([torch.zeros(1, 1, v.shape[-1], device=v.device), v], dim=1)
+                
                 encoder_state[new_k] = v
+        
+        # Add missing LayerNorm weights if old format
+        if is_old_format and 'patch_embed.1.weight' not in encoder_state:
+            encoder_state['patch_embed.1.weight'] = torch.ones(256)
+            encoder_state['patch_embed.1.bias'] = torch.zeros(256)
         
         try:
             audio_encoder.load_state_dict(encoder_state, strict=False)
-            print(f"  ✓ Loaded MAE encoder from {mae_checkpoint}")
+            if is_old_format:
+                print(f"  ✓ Loaded MAE encoder from {mae_checkpoint} (adapted from old format)")
+            else:
+                print(f"  ✓ Loaded MAE encoder from {mae_checkpoint}")
         except Exception as e:
             print(f"  Warning: Could not load MAE weights: {e}")
             print("  Using randomly initialized audio encoder")
@@ -1396,10 +1426,29 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_mode
             num_heads=4, mask_ratio=0.0  # No masking during inference
         ).to(device)
         
-        # Load checkpoint
+        # Load checkpoint with compatibility for old format
         checkpoint = torch.load(mae_checkpoint, map_location=device)
         state_dict = checkpoint.get('model_state_dict', checkpoint)
-        mae_encoder.load_state_dict(state_dict)
+        
+        try:
+            mae_encoder.load_state_dict(state_dict)
+        except RuntimeError:
+            print(f"  Note: Old checkpoint format detected, adapting...")
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k == 'patch_embed.weight':
+                    new_state_dict['patch_embed.0.weight'] = v
+                elif k == 'patch_embed.bias':
+                    new_state_dict['patch_embed.0.bias'] = v
+                elif k == 'pos_embed':
+                    new_state_dict[k] = torch.cat([torch.zeros(1, 1, v.shape[-1], device=v.device), v], dim=1)
+                else:
+                    new_state_dict[k] = v
+            if 'patch_embed.1.weight' not in new_state_dict:
+                new_state_dict['patch_embed.1.weight'] = torch.ones(256)
+                new_state_dict['patch_embed.1.bias'] = torch.zeros(256)
+            mae_encoder.load_state_dict(new_state_dict, strict=False)
+        
         mae_encoder.eval()
         for p in mae_encoder.parameters():
             p.requires_grad = False
@@ -1775,7 +1824,34 @@ def diagnose_audio_influence(model_path="checkpoints/sft/best_model",
     mae_encoder = TransformerMAE(input_dim=128, hidden_dim=256, num_layers=4, num_heads=4, mask_ratio=0.0).to(device)
     checkpoint = torch.load(mae_checkpoint, map_location=device)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
-    mae_encoder.load_state_dict(state_dict)
+    
+    # Handle old checkpoint format (before AudioMAE changes)
+    try:
+        mae_encoder.load_state_dict(state_dict)
+    except RuntimeError as e:
+        print(f"  Note: Old checkpoint format detected, adapting...")
+        # Convert old format to new format
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k == 'patch_embed.weight':
+                new_state_dict['patch_embed.0.weight'] = v
+            elif k == 'patch_embed.bias':
+                new_state_dict['patch_embed.0.bias'] = v
+            elif k == 'pos_embed':
+                # Old format: (1, max_len, dim), new format: (1, max_len+1, dim)
+                # Pad with zeros for the extra CLS position
+                new_state_dict[k] = torch.cat([torch.zeros(1, 1, v.shape[-1], device=v.device), v], dim=1)
+            else:
+                new_state_dict[k] = v
+        
+        # Add missing LayerNorm weights with defaults
+        if 'patch_embed.1.weight' not in new_state_dict:
+            new_state_dict['patch_embed.1.weight'] = torch.ones(256)
+            new_state_dict['patch_embed.1.bias'] = torch.zeros(256)
+        
+        mae_encoder.load_state_dict(new_state_dict, strict=False)
+        print("  ✓ Adapted old checkpoint successfully")
+    
     mae_encoder.eval()
     
     # Load projector
