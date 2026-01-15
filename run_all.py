@@ -173,19 +173,31 @@ def _init_model_classes():
             return x[:, 0]  # Return CLS token
     
     class _AudioProjector(nn.Module):
-        """Projects audio embeddings to LLM embedding space."""
-        def __init__(self, audio_dim, llm_dim, hidden_dim=None):
+        """Projects audio embeddings to LLM embedding space with multiple tokens."""
+        def __init__(self, audio_dim, llm_dim, num_tokens=8, hidden_dim=None):
             super().__init__()
+            self.num_tokens = num_tokens
+            self.llm_dim = llm_dim
             hidden_dim = hidden_dim or (audio_dim + llm_dim) // 2
+            
+            # Project to num_tokens * llm_dim, then reshape
             self.proj = nn.Sequential(
                 nn.Linear(audio_dim, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, llm_dim),
-                nn.LayerNorm(llm_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, llm_dim * num_tokens),
             )
+            self.norm = nn.LayerNorm(llm_dim)
         
         def forward(self, x):
-            return self.proj(x)
+            # x: (B, audio_dim) or (B, 1, audio_dim)
+            if x.dim() == 3:
+                x = x.squeeze(1)
+            x = self.proj(x)  # (B, llm_dim * num_tokens)
+            x = x.view(x.size(0), self.num_tokens, self.llm_dim)  # (B, num_tokens, llm_dim)
+            x = self.norm(x)
+            return x  # (B, num_tokens, llm_dim)
     
     TransformerMAE = _TransformerMAE
     AudioProjector = _AudioProjector
@@ -527,7 +539,7 @@ def train_mae(data_path="data/processed", output_dir="checkpoints/mae",
     
     # Dataset
     class AudioDataset(Dataset):
-        def __init__(self, data, target_length=10):
+        def __init__(self, data, target_length=20):
             self.data = data
             self.target_length = target_length
         
@@ -681,9 +693,9 @@ def train_mae(data_path="data/processed", output_dir="checkpoints/mae",
 
 def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
               mae_path="checkpoints/mae", model_name="google/gemma-2b-it", 
-              batch_size=4, num_epochs=5, use_wandb=False,
-              lora_r=32, lora_alpha=64, learning_rate=1e-4, max_samples=None,
-              freeze_audio_encoder=True):
+              batch_size=4, num_epochs=3, use_wandb=False,
+              lora_r=16, lora_alpha=32, learning_rate=2e-5, max_samples=None,
+              freeze_audio_encoder=True, lora_dropout=0.1, weight_decay=0.01):
     """
     Train SFT for audio captioning WITH audio encoder integration.
     
@@ -815,7 +827,7 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
         r=lora_r,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=lora_alpha,
-        lora_dropout=0,
+        lora_dropout=lora_dropout,
         use_gradient_checkpointing="unsloth",
     )
     
@@ -829,8 +841,9 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
     print("\n3. Creating audio projector...")
     
     audio_dim = 256  # MAE encoder output dimension
-    projector = AudioProjector(audio_dim, llm_dim).to(device)
-    print(f"  Projector: {audio_dim} → {llm_dim}")
+    num_audio_tokens = 8  # Number of audio tokens to use
+    projector = AudioProjector(audio_dim, llm_dim, num_tokens=num_audio_tokens).to(device)
+    print(f"  Projector: {audio_dim} → {num_audio_tokens} tokens × {llm_dim}")
     
     # =========================================================================
     # 4. Load training data
@@ -850,7 +863,7 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
     
     # Dataset that returns audio features + captions
     class AudioCaptionDataset(Dataset):
-        def __init__(self, data, tokenizer, max_length=256, target_audio_len=10):
+        def __init__(self, data, tokenizer, max_length=256, target_audio_len=20):
             self.data = data
             self.tokenizer = tokenizer
             self.max_length = max_length
@@ -876,22 +889,39 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
                 'caption': sample['caption'],
             }
     
+    # Prompt template - same format used in GRPO for consistency
+    PROMPT_TEMPLATE = "<start_of_turn>user\nDescribe this audio.<end_of_turn>\n<start_of_turn>model\n"
+    RESPONSE_END = "<end_of_turn>"
+    
+    # Get prompt length for masking
+    prompt_tokens = tokenizer(PROMPT_TEMPLATE, add_special_tokens=False)['input_ids']
+    prompt_length = len(prompt_tokens)
+    
     def collate_fn(batch):
         audio_features = torch.stack([b['audio_features'] for b in batch])
         captions = [b['caption'] for b in batch]
         
-        # Tokenize captions
+        # Format with prompt template (same as GRPO uses)
+        formatted_texts = [
+            f"{PROMPT_TEMPLATE}{caption}{RESPONSE_END}"
+            for caption in captions
+        ]
+        
+        # Tokenize full sequences
         tokenized = tokenizer(
-            captions,
+            formatted_texts,
             padding=True,
             truncation=True,
             max_length=256,
             return_tensors='pt',
         )
         
-        # Create labels (shift for causal LM)
+        # Create labels - mask prompt tokens (only compute loss on caption + end token)
         labels = tokenized['input_ids'].clone()
+        # Mask padding tokens
         labels[labels == tokenizer.pad_token_id] = -100
+        # Mask prompt tokens (first prompt_length tokens) - don't compute loss on prompt
+        labels[:, :prompt_length] = -100
         
         return {
             'audio_features': audio_features,
@@ -915,7 +945,9 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
     print(f"  - Epochs: {num_epochs}")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Learning rate: {learning_rate}")
-    print(f"  - LoRA rank: {lora_r}")
+    print(f"  - LoRA rank: {lora_r}, alpha: {lora_alpha}")
+    print(f"  - LoRA dropout: {lora_dropout}")
+    print(f"  - Weight decay: {weight_decay}")
     
     # Optimizer for projector + LoRA params
     trainable_params = list(projector.parameters())
@@ -923,7 +955,7 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
     if audio_encoder and not freeze_audio_encoder:
         trainable_params += list(audio_encoder.parameters())
     
-    optimizer = AdamW(trainable_params, lr=learning_rate, weight_decay=0.01)
+    optimizer = AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
     
     # Scheduler
     total_steps = len(train_loader) * num_epochs
@@ -965,23 +997,23 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
                 audio_embeds = audio_features.mean(dim=1)  # (B, 128)
                 audio_embeds = F.pad(audio_embeds, (0, 256 - 128))  # Pad to 256
             
-            # 2. Project to LLM space
-            audio_tokens = projector(audio_embeds)  # (B, llm_dim)
-            audio_tokens = audio_tokens.unsqueeze(1)  # (B, 1, llm_dim) - single audio token
+            # 2. Project to LLM space (now outputs multiple tokens)
+            audio_tokens = projector(audio_embeds)  # (B, num_audio_tokens, llm_dim)
             
             # 3. Get text embeddings
             text_embeds = embed_tokens(input_ids)  # (B, seq_len, llm_dim)
             
-            # 4. Concatenate: [AUDIO_TOKEN] + [TEXT_TOKENS]
+            # 4. Concatenate: [AUDIO_TOKENS] + [TEXT_TOKENS]
             inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
             
-            # 5. Extend attention mask and labels for audio token
+            # 5. Extend attention mask and labels for audio tokens
             B = audio_features.size(0)
-            audio_mask = torch.ones(B, 1, device=device, dtype=attention_mask.dtype)
+            num_audio_toks = audio_tokens.size(1)
+            audio_mask = torch.ones(B, num_audio_toks, device=device, dtype=attention_mask.dtype)
             extended_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
             
-            # Labels: -100 for audio token (don't compute loss on it)
-            audio_labels = torch.full((B, 1), -100, device=device, dtype=labels.dtype)
+            # Labels: -100 for audio tokens (don't compute loss on them)
+            audio_labels = torch.full((B, num_audio_toks), -100, device=device, dtype=labels.dtype)
             extended_labels = torch.cat([audio_labels, labels], dim=1)
             
             # 6. Forward through LLM
@@ -1026,14 +1058,15 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
                     audio_embeds = audio_features.mean(dim=1)
                     audio_embeds = F.pad(audio_embeds, (0, 256 - 128))
                 
-                audio_tokens = projector(audio_embeds).unsqueeze(1)
+                audio_tokens = projector(audio_embeds)  # (B, num_audio_tokens, llm_dim)
                 text_embeds = embed_tokens(input_ids)
                 inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
                 
                 B = audio_features.size(0)
-                audio_mask = torch.ones(B, 1, device=device, dtype=attention_mask.dtype)
+                num_audio_toks = audio_tokens.size(1)
+                audio_mask = torch.ones(B, num_audio_toks, device=device, dtype=attention_mask.dtype)
                 extended_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
-                audio_labels = torch.full((B, 1), -100, device=device, dtype=labels.dtype)
+                audio_labels = torch.full((B, num_audio_toks), -100, device=device, dtype=labels.dtype)
                 extended_labels = torch.cat([audio_labels, labels], dim=1)
                 
                 outputs = model(
@@ -1229,7 +1262,7 @@ class HybridRewardModel:
 # STEP 5: GRPO Training
 # =============================================================================
 
-def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_model",
+def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_model",
                output_dir="checkpoints/grpo", num_steps=100, use_wandb=False,
                num_generations=4, reward_alpha=0.5, batch_size=2, learning_rate=5e-6,
                mae_path="checkpoints/mae", projector_path="checkpoints/sft/projector.pt"):
@@ -1396,7 +1429,7 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
             return None
         
         # Normalize and pad/truncate to target length
-        target_len = 10
+        target_len = 20  # Increased from 10 for more context
         if len(audio_features) < target_len:
             padding = np.zeros((target_len - len(audio_features), 128))
             audio_features = np.concatenate([audio_features, padding], axis=0)
@@ -1410,10 +1443,10 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
             # Get CLS token from MAE encoder using built-in method
             audio_embedding = mae_encoder.get_encoder_output(audio_tensor)
             
-            # Project to LLM dimension
-            audio_projected = projector(audio_embedding.unsqueeze(1))
+            # Project to LLM dimension (now returns multiple tokens)
+            audio_projected = projector(audio_embedding)  # (1, num_tokens, llm_dim)
         
-        return audio_projected  # Shape: (1, 1, llm_dim)
+        return audio_projected  # Shape: (1, num_tokens, llm_dim)
     
     # =========================================================================
     # 6. Training loop
@@ -1439,7 +1472,7 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
         
         for sample in batch_samples:
             # Process audio
-            audio_emb = process_audio(sample['audio_features']) if has_audio else None
+            audio_tokens = process_audio(sample['audio_features']) if has_audio else None
             
             # Create prompt
             prompt = "<start_of_turn>user\nDescribe this audio.<end_of_turn>\n<start_of_turn>model\n"
@@ -1454,19 +1487,43 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
                 model.eval()
                 
                 with torch.no_grad():
-                    # For audio-conditioned generation, we'd ideally prepend audio embeddings
-                    # to the input. For simplicity, we generate based on the prompt
-                    # and use the audio info implicitly through the SFT training
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=64,
-                        do_sample=True,
-                        temperature=0.8,
-                        top_p=0.9,
-                        pad_token_id=tokenizer.pad_token_id,
-                        return_dict_in_generate=True,
-                        output_scores=True,
-                    )
+                    # FIXED: Prepend audio embeddings to text for audio-conditioned generation
+                    if audio_tokens is not None:
+                        # Get text embeddings
+                        embed_tokens = model.get_input_embeddings()
+                        text_embeds = embed_tokens(inputs['input_ids'])  # (1, seq_len, llm_dim)
+                        
+                        # Concatenate: [AUDIO_TOKENS] + [TEXT_TOKENS]
+                        inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
+                        
+                        # Extend attention mask
+                        num_audio_toks = audio_tokens.size(1)
+                        audio_mask = torch.ones(1, num_audio_toks, device=device, dtype=inputs['attention_mask'].dtype)
+                        attention_mask = torch.cat([audio_mask, inputs['attention_mask']], dim=1)
+                        
+                        outputs = model.generate(
+                            inputs_embeds=inputs_embeds,
+                            attention_mask=attention_mask,
+                            max_new_tokens=64,
+                            do_sample=True,
+                            temperature=0.8,
+                            top_p=0.9,
+                            pad_token_id=tokenizer.pad_token_id,
+                            return_dict_in_generate=True,
+                            output_scores=True,
+                        )
+                    else:
+                        # Fallback: text-only generation
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=64,
+                            do_sample=True,
+                            temperature=0.8,
+                            top_p=0.9,
+                            pad_token_id=tokenizer.pad_token_id,
+                            return_dict_in_generate=True,
+                            output_scores=True,
+                        )
                 
                 generated_ids = outputs.sequences[0]
                 generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -1596,10 +1653,13 @@ def main():
     parser.add_argument("--mae-heads", type=int, default=4, help="MAE attention heads")
     parser.add_argument("--mae-mask-ratio", type=float, default=0.75, help="MAE mask ratio")
     
-    # SFT arguments (optimized defaults)
-    parser.add_argument("--sft-epochs", type=int, default=5, help="SFT training epochs (default: 5)")
-    parser.add_argument("--sft-lr", type=float, default=1e-4, help="SFT learning rate (default: 1e-4)")
-    parser.add_argument("--sft-lora-r", type=int, default=32, help="LoRA rank (default: 32)")
+    # SFT arguments (optimized defaults to prevent overfitting)
+    parser.add_argument("--sft-epochs", type=int, default=3, help="SFT training epochs (default: 3)")
+    parser.add_argument("--sft-lr", type=float, default=2e-5, help="SFT learning rate (default: 2e-5)")
+    parser.add_argument("--sft-lora-r", type=int, default=16, help="LoRA rank (default: 16)")
+    parser.add_argument("--sft-lora-alpha", type=int, default=32, help="LoRA alpha (default: 32)")
+    parser.add_argument("--sft-lora-dropout", type=float, default=0.1, help="LoRA dropout (default: 0.1)")
+    parser.add_argument("--sft-weight-decay", type=float, default=0.01, help="Weight decay (default: 0.01)")
     parser.add_argument("--sft-max-samples", type=int, default=None, help="Max training samples (default: all)")
     parser.add_argument("--mae-path", type=str, default="checkpoints/mae", help="Path to pretrained MAE encoder")
     parser.add_argument("--finetune-audio-encoder", action="store_true", help="Fine-tune audio encoder (default: frozen)")
@@ -1675,6 +1735,9 @@ def main():
             num_epochs=args.sft_epochs,
             learning_rate=args.sft_lr,
             lora_r=args.sft_lora_r,
+            lora_alpha=args.sft_lora_alpha,
+            lora_dropout=args.sft_lora_dropout,
+            weight_decay=args.sft_weight_decay,
             max_samples=args.sft_max_samples,
             mae_path=args.mae_path,
             freeze_audio_encoder=not args.finetune_audio_encoder,
@@ -1687,6 +1750,9 @@ def main():
             num_epochs=args.sft_epochs,
             learning_rate=args.sft_lr,
             lora_r=args.sft_lora_r,
+            lora_alpha=args.sft_lora_alpha,
+            lora_dropout=args.sft_lora_dropout,
+            weight_decay=args.sft_weight_decay,
             max_samples=args.sft_max_samples,
             mae_path=args.mae_path,
             freeze_audio_encoder=not args.finetune_audio_encoder,
