@@ -936,7 +936,7 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
     print(f"  LLM embedding dimension: {llm_dim}")
     
     # =========================================================================
-    # 3. Create audio projector
+    # 3. Create audio projector with improved architecture
     # =========================================================================
     print("\n3. Creating audio projector...")
     
@@ -944,6 +944,44 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
     num_audio_tokens = 8  # Number of audio tokens to use
     projector = AudioProjector(audio_dim, llm_dim, num_tokens=num_audio_tokens).to(device)
     print(f"  Projector: {audio_dim} → {num_audio_tokens} tokens × {llm_dim}")
+    
+    # Audio feature normalization layer
+    audio_norm = nn.LayerNorm(128).to(device)  # Normalize raw audio features
+    
+    # Contrastive loss head - project both audio and text to shared space for alignment
+    class ContrastiveHead(nn.Module):
+        """Projects audio and text embeddings to shared space for contrastive learning."""
+        def __init__(self, audio_dim, text_dim, shared_dim=256):
+            super().__init__()
+            self.audio_proj = nn.Sequential(
+                nn.Linear(audio_dim, shared_dim),
+                nn.ReLU(),
+                nn.Linear(shared_dim, shared_dim),
+            )
+            self.text_proj = nn.Sequential(
+                nn.Linear(text_dim, shared_dim),
+                nn.ReLU(),
+                nn.Linear(shared_dim, shared_dim),
+            )
+            self.temperature = nn.Parameter(torch.ones(1) * 0.07)
+        
+        def forward(self, audio_embeds, text_embeds):
+            """Compute contrastive loss between audio and text embeddings."""
+            # Normalize embeddings
+            audio_z = F.normalize(self.audio_proj(audio_embeds), dim=-1)  # (B, shared_dim)
+            text_z = F.normalize(self.text_proj(text_embeds), dim=-1)    # (B, shared_dim)
+            
+            # Compute similarity matrix
+            logits = torch.matmul(audio_z, text_z.T) / self.temperature.clamp(min=0.01)
+            
+            # InfoNCE loss (bidirectional)
+            labels = torch.arange(logits.size(0), device=logits.device)
+            loss_a2t = F.cross_entropy(logits, labels)
+            loss_t2a = F.cross_entropy(logits.T, labels)
+            return (loss_a2t + loss_t2a) / 2
+    
+    contrastive_head = ContrastiveHead(audio_dim, llm_dim).to(device)
+    print(f"  Contrastive head: audio({audio_dim}) + text({llm_dim}) → shared(256)")
     
     # =========================================================================
     # 4. Load training data
@@ -1039,9 +1077,9 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
                             collate_fn=collate_fn, num_workers=2)
     
     # =========================================================================
-    # 5. Training loop
+    # 5. Training loop with advanced techniques
     # =========================================================================
-    print("\n5. Starting training...")
+    print("\n5. Starting training with improved techniques...")
     print(f"  - Epochs: {num_epochs}")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Learning rate: {learning_rate}")
@@ -1049,8 +1087,16 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
     print(f"  - LoRA dropout: {lora_dropout}")
     print(f"  - Weight decay: {weight_decay}")
     
-    # Optimizer for projector + LoRA params
+    # Training improvements
+    audio_dropout_rate = 0.15  # Randomly drop audio 15% of the time (forces text grounding)
+    contrastive_weight = 0.1   # Weight for contrastive loss
+    print(f"  - Audio dropout: {audio_dropout_rate}")
+    print(f"  - Contrastive loss weight: {contrastive_weight}")
+    
+    # Optimizer for projector + contrastive head + LoRA params
     trainable_params = list(projector.parameters())
+    trainable_params += list(contrastive_head.parameters())
+    trainable_params += list(audio_norm.parameters())
     trainable_params += [p for p in model.parameters() if p.requires_grad]
     if audio_encoder and not freeze_audio_encoder:
         trainable_params += list(audio_encoder.parameters())
@@ -1076,10 +1122,13 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
         # Training
         model.train()
         projector.train()
+        contrastive_head.train()
+        audio_norm.train()
         if audio_encoder:
             audio_encoder.train() if not freeze_audio_encoder else audio_encoder.eval()
         
         train_loss = 0
+        train_contrastive_loss = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}")
         
         for step, batch in enumerate(pbar):
@@ -1087,6 +1136,11 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
+            
+            B = audio_features.size(0)
+            
+            # Apply audio feature normalization (per-sample)
+            audio_features = audio_norm(audio_features)  # (B, T, 128) - LayerNorm on feature dim
             
             # 1. Encode audio with MAE encoder
             if audio_encoder:
@@ -1100,30 +1154,62 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
             # 2. Project to LLM space (now outputs multiple tokens)
             audio_tokens = projector(audio_embeds)  # (B, num_audio_tokens, llm_dim)
             
-            # 3. Get text embeddings
+            # 3. Audio dropout: randomly drop audio to force model to use text context
+            # This prevents the model from ignoring audio and generating generic captions
+            use_audio = torch.rand(B, device=device) > audio_dropout_rate  # (B,)
+            if model.training:
+                # Zero out audio for dropped samples
+                audio_tokens = audio_tokens * use_audio.view(B, 1, 1).float()
+            
+            # 4. Get text embeddings
             text_embeds = embed_tokens(input_ids)  # (B, seq_len, llm_dim)
             
-            # 4. Concatenate: [AUDIO_TOKENS] + [TEXT_TOKENS]
+            # 5. Concatenate: [AUDIO_TOKENS] + [TEXT_TOKENS]
             inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
             
-            # 5. Extend attention mask and labels for audio tokens
-            B = audio_features.size(0)
+            # 6. Extend attention mask and labels for audio tokens
             num_audio_toks = audio_tokens.size(1)
             audio_mask = torch.ones(B, num_audio_toks, device=device, dtype=attention_mask.dtype)
+            # Zero attention for dropped audio samples
+            if model.training:
+                audio_mask = audio_mask * use_audio.view(B, 1).float()
             extended_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
             
             # Labels: -100 for audio tokens (don't compute loss on them)
             audio_labels = torch.full((B, num_audio_toks), -100, device=device, dtype=labels.dtype)
             extended_labels = torch.cat([audio_labels, labels], dim=1)
             
-            # 6. Forward through LLM
+            # 7. Forward through LLM
             outputs = model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=extended_attention_mask,
                 labels=extended_labels,
             )
             
-            loss = outputs.loss
+            lm_loss = outputs.loss
+            
+            # 8. Contrastive loss: align audio embeddings with text embeddings
+            # Use mean of text embeddings (after prompt) as text representation
+            # Find where labels != -100 to get caption text positions
+            caption_mask = (labels != -100).float()  # (B, seq_len)
+            if caption_mask.sum() > 0:
+                # Weighted average of text embeddings at caption positions
+                caption_embeds = (text_embeds * caption_mask.unsqueeze(-1)).sum(dim=1)  # (B, llm_dim)
+                caption_embeds = caption_embeds / (caption_mask.sum(dim=1, keepdim=True) + 1e-8)
+                
+                # Only compute contrastive loss for samples with audio
+                if use_audio.sum() > 0:
+                    cont_loss = contrastive_head(
+                        audio_embeds[use_audio], 
+                        caption_embeds[use_audio]
+                    )
+                else:
+                    cont_loss = torch.tensor(0.0, device=device)
+            else:
+                cont_loss = torch.tensor(0.0, device=device)
+            
+            # Combined loss
+            loss = lm_loss + contrastive_weight * cont_loss
             loss.backward()
             
             # Gradient clipping
@@ -1133,24 +1219,37 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
             scheduler.step()
             optimizer.zero_grad()
             
-            train_loss += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            train_loss += lm_loss.item()
+            train_contrastive_loss += cont_loss.item() if isinstance(cont_loss, torch.Tensor) else cont_loss
+            pbar.set_postfix({
+                'lm': f"{lm_loss.item():.4f}", 
+                'cont': f"{cont_loss.item():.4f}" if isinstance(cont_loss, torch.Tensor) else "0",
+            })
         
         train_loss /= len(train_loader)
+        train_contrastive_loss /= len(train_loader)
         
         # Validation
         model.eval()
         projector.eval()
+        contrastive_head.eval()
+        audio_norm.eval()
         if audio_encoder:
             audio_encoder.eval()
         
         val_loss = 0
+        val_contrastive_loss = 0
         with torch.no_grad():
             for batch in val_loader:
                 audio_features = batch['audio_features'].to(device)
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 labels = batch['labels'].to(device)
+                
+                B = audio_features.size(0)
+                
+                # Apply audio normalization
+                audio_features = audio_norm(audio_features)
                 
                 if audio_encoder:
                     audio_embeds = audio_encoder(audio_features)
@@ -1162,7 +1261,6 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
                 text_embeds = embed_tokens(input_ids)
                 inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
                 
-                B = audio_features.size(0)
                 num_audio_toks = audio_tokens.size(1)
                 audio_mask = torch.ones(B, num_audio_toks, device=device, dtype=attention_mask.dtype)
                 extended_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
@@ -1175,10 +1273,19 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
                     labels=extended_labels,
                 )
                 val_loss += outputs.loss.item()
+                
+                # Contrastive loss for validation
+                caption_mask = (labels != -100).float()
+                if caption_mask.sum() > 0:
+                    caption_embeds = (text_embeds * caption_mask.unsqueeze(-1)).sum(dim=1)
+                    caption_embeds = caption_embeds / (caption_mask.sum(dim=1, keepdim=True) + 1e-8)
+                    cont_loss = contrastive_head(audio_embeds, caption_embeds)
+                    val_contrastive_loss += cont_loss.item()
         
         val_loss /= len(val_loader)
+        val_contrastive_loss /= len(val_loader)
         
-        print(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+        print(f"Epoch {epoch}: Train LM={train_loss:.4f} Cont={train_contrastive_loss:.4f} | Val LM={val_loss:.4f} Cont={val_contrastive_loss:.4f}")
         
         # Save best model
         if val_loss < best_val_loss:
@@ -1186,21 +1293,29 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
             torch.save({
                 'projector_state_dict': projector.state_dict(),
                 'audio_encoder_state_dict': audio_encoder.state_dict() if audio_encoder else None,
+                'contrastive_head_state_dict': contrastive_head.state_dict(),
+                'audio_norm_state_dict': audio_norm.state_dict(),
                 'val_loss': val_loss,
+                'val_contrastive_loss': val_contrastive_loss,
                 'epoch': epoch,
             }, f"{output_dir}/best_audio_model.pt")
             model.save_pretrained(f"{output_dir}/best_model")
             tokenizer.save_pretrained(f"{output_dir}/best_model")
-            print(f"  ✓ Saved best model (val_loss: {val_loss:.4f})")
+            print(f"  ✓ Saved best model (val_loss: {val_loss:.4f}, val_cont: {val_contrastive_loss:.4f})")
     
     # Save final model
     torch.save({
         'projector_state_dict': projector.state_dict(),
         'audio_encoder_state_dict': audio_encoder.state_dict() if audio_encoder else None,
+        'contrastive_head_state_dict': contrastive_head.state_dict(),
+        'audio_norm_state_dict': audio_norm.state_dict(),
     }, f"{output_dir}/final_audio_model.pt")
     
     # Save projector separately for GRPO
     torch.save(projector.state_dict(), f"{output_dir}/projector.pt")
+    
+    # Save audio_norm for inference
+    torch.save(audio_norm.state_dict(), f"{output_dir}/audio_norm.pt")
     
     model.save_pretrained(f"{output_dir}/final_model")
     tokenizer.save_pretrained(f"{output_dir}/final_model")
@@ -1482,15 +1597,26 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_mode
     
     # Load audio projector
     projector = None
+    audio_norm = None
     llm_dim = model.get_input_embeddings().weight.shape[1]
     
     if os.path.exists(projector_path):
-        projector = AudioProjector(256, llm_dim).to(device)
+        projector = AudioProjector(256, llm_dim, num_tokens=8).to(device)
         projector.load_state_dict(torch.load(projector_path, map_location=device))
         projector.eval()
         for p in projector.parameters():
             p.requires_grad = False
         print(f"  ✓ Audio projector loaded from {projector_path}")
+        
+        # Load audio normalization layer
+        audio_norm_path = Path(projector_path).parent / "audio_norm.pt"
+        audio_norm = nn.LayerNorm(128).to(device)
+        if audio_norm_path.exists():
+            audio_norm.load_state_dict(torch.load(audio_norm_path, map_location=device))
+            print(f"  ✓ Audio norm loaded from {audio_norm_path}")
+        else:
+            print(f"  Note: audio_norm.pt not found, using fresh initialization")
+        audio_norm.eval()
     else:
         print(f"  ⚠ Projector not found at {projector_path}")
     
@@ -1547,7 +1673,7 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_mode
         if not has_audio:
             return None
         
-        # Normalize and pad/truncate to target length
+        # Pad/truncate to target length
         target_len = 20  # Increased from 10 for more context
         if len(audio_features) < target_len:
             padding = np.zeros((target_len - len(audio_features), 128))
@@ -1555,10 +1681,13 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_mode
         else:
             audio_features = audio_features[:target_len]
         
-        audio_features = (audio_features - audio_features.mean()) / (audio_features.std() + 1e-8)
         audio_tensor = torch.from_numpy(audio_features).float().unsqueeze(0).to(device)
         
         with torch.no_grad():
+            # Apply learned audio normalization
+            if audio_norm is not None:
+                audio_tensor = audio_norm(audio_tensor)
+            
             # Get CLS token from MAE encoder using built-in method
             audio_embedding = mae_encoder.get_encoder_output(audio_tensor)
             
@@ -1860,6 +1989,16 @@ def diagnose_audio_influence(model_path="checkpoints/sft/best_model",
     projector.load_state_dict(torch.load(projector_path, map_location=device))
     projector.eval()
     
+    # Load audio normalization layer
+    audio_norm_path = Path(projector_path).parent / "audio_norm.pt"
+    audio_norm = nn.LayerNorm(128).to(device)
+    if audio_norm_path.exists():
+        audio_norm.load_state_dict(torch.load(audio_norm_path, map_location=device))
+        print(f"  ✓ Loaded audio_norm from {audio_norm_path}")
+    else:
+        print(f"  Note: audio_norm.pt not found, using fresh initialization")
+    audio_norm.eval()
+    
     # Load test data
     with open(Path(data_path) / "test.pkl", 'rb') as f:
         test_data = pickle.load(f)
@@ -1871,19 +2010,22 @@ def diagnose_audio_influence(model_path="checkpoints/sft/best_model",
             audio_features = np.concatenate([audio_features, padding], axis=0)
         else:
             audio_features = audio_features[:target_len]
-        audio_features = (audio_features - audio_features.mean()) / (audio_features.std() + 1e-8)
         audio_tensor = torch.from_numpy(audio_features).float().unsqueeze(0).to(device)
         with torch.no_grad():
+            # Apply learned audio normalization
+            audio_tensor = audio_norm(audio_tensor)
             audio_embedding = mae_encoder.get_encoder_output(audio_tensor)
             audio_projected = projector(audio_embedding)
         return audio_projected
     
     def generate_caption(audio_tokens, temperature=0.3):
         """Generate with low temperature for more deterministic output."""
+        import re
         embed_tokens = model.get_input_embeddings()
         prompt = "<start_of_turn>user\nDescribe this audio.<end_of_turn>\n<start_of_turn>model\n"
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         generated_ids = inputs['input_ids'].clone()
+        prompt_len = generated_ids.size(1)
         
         for _ in range(64):
             with torch.no_grad():
@@ -1900,11 +2042,15 @@ def diagnose_audio_influence(model_path="checkpoints/sft/best_model",
                 if next_token.item() == tokenizer.eos_token_id:
                     break
         
-        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        if "<start_of_turn>model" in text:
-            text = text.split("<start_of_turn>model")[-1].strip()
-        if "<end_of_turn>" in text:
-            text = text.split("<end_of_turn>")[0].strip()
+        # Decode only the generated part (skip prompt tokens)
+        generated_only = generated_ids[0, prompt_len:]
+        text = tokenizer.decode(generated_only, skip_special_tokens=True)
+        
+        # Clean up any remaining template artifacts
+        text = re.sub(r'<[^>]+>', '', text)  # Remove any XML-like tags
+        text = re.sub(r'\b(user|model)\b', '', text, flags=re.IGNORECASE)  # Remove "user"/"model"
+        text = re.sub(r'Describe this audio\.?', '', text)  # Remove prompt text
+        text = ' '.join(text.split()).strip()  # Normalize whitespace
         return text
     
     print("=" * 60)
