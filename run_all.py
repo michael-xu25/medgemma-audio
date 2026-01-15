@@ -1720,6 +1720,163 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_mode
 
 
 # =============================================================================
+# DIAGNOSTIC: Test if audio actually influences outputs
+# =============================================================================
+
+def diagnose_audio_influence(model_path="checkpoints/sft/best_model", 
+                             mae_path="checkpoints/mae",
+                             projector_path="checkpoints/sft/projector.pt",
+                             data_path="data/processed"):
+    """
+    Diagnostic tool to test if the model actually uses audio information.
+    
+    Tests:
+    1. Consistency: Same audio → similar outputs?
+    2. Distinctiveness: Different audios → different outputs?
+    3. Audio vs No-Audio: Does removing audio change outputs?
+    """
+    print("\n" + "=" * 60)
+    print("DIAGNOSTIC: Testing Audio Influence")
+    print("=" * 60 + "\n")
+    
+    import pickle
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+    from pathlib import Path
+    
+    _init_model_classes()
+    global TransformerMAE, AudioProjector
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        print("Error: HF_TOKEN not set")
+        return
+    
+    # Load model
+    from unsloth import FastLanguageModel
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_path,
+        max_seq_length=512,
+        load_in_4bit=True,
+        token=hf_token,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    FastLanguageModel.for_inference(model)
+    
+    # Load MAE encoder
+    mae_checkpoint = Path(mae_path) / "best_model.pt"
+    if not mae_checkpoint.exists():
+        mae_checkpoint = Path(mae_path) / "final_model.pt"
+    
+    mae_encoder = TransformerMAE(input_dim=128, hidden_dim=256, num_layers=4, num_heads=4, mask_ratio=0.0).to(device)
+    checkpoint = torch.load(mae_checkpoint, map_location=device)
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    mae_encoder.load_state_dict(state_dict)
+    mae_encoder.eval()
+    
+    # Load projector
+    llm_dim = model.get_input_embeddings().weight.shape[1]
+    projector = AudioProjector(256, llm_dim, num_tokens=8).to(device)
+    projector.load_state_dict(torch.load(projector_path, map_location=device))
+    projector.eval()
+    
+    # Load test data
+    with open(Path(data_path) / "test.pkl", 'rb') as f:
+        test_data = pickle.load(f)
+    
+    def process_audio(audio_features):
+        target_len = 20
+        if len(audio_features) < target_len:
+            padding = np.zeros((target_len - len(audio_features), 128))
+            audio_features = np.concatenate([audio_features, padding], axis=0)
+        else:
+            audio_features = audio_features[:target_len]
+        audio_features = (audio_features - audio_features.mean()) / (audio_features.std() + 1e-8)
+        audio_tensor = torch.from_numpy(audio_features).float().unsqueeze(0).to(device)
+        with torch.no_grad():
+            audio_embedding = mae_encoder.get_encoder_output(audio_tensor)
+            audio_projected = projector(audio_embedding)
+        return audio_projected
+    
+    def generate_caption(audio_tokens, temperature=0.3):
+        """Generate with low temperature for more deterministic output."""
+        embed_tokens = model.get_input_embeddings()
+        prompt = "<start_of_turn>user\nDescribe this audio.<end_of_turn>\n<start_of_turn>model\n"
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        generated_ids = inputs['input_ids'].clone()
+        
+        for _ in range(64):
+            with torch.no_grad():
+                text_embeds = embed_tokens(generated_ids)
+                if audio_tokens is not None:
+                    inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
+                else:
+                    inputs_embeds = text_embeds
+                outputs = model(inputs_embeds=inputs_embeds)
+                logits = outputs.logits[:, -1, :] / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
+        
+        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        if "<start_of_turn>model" in text:
+            text = text.split("<start_of_turn>model")[-1].strip()
+        if "<end_of_turn>" in text:
+            text = text.split("<end_of_turn>")[0].strip()
+        return text
+    
+    print("=" * 60)
+    print("TEST 1: Consistency (same audio, 3 generations)")
+    print("=" * 60)
+    sample = test_data[0]
+    audio_tokens = process_audio(sample['audio_features'])
+    print(f"Reference: {sample['caption'][:100]}...")
+    print(f"\nGenerations (temperature=0.3):")
+    for i in range(3):
+        caption = generate_caption(audio_tokens, temperature=0.3)
+        print(f"  {i+1}. {caption[:80]}...")
+    
+    print("\n" + "=" * 60)
+    print("TEST 2: Distinctiveness (5 different audios)")
+    print("=" * 60)
+    for i in range(5):
+        sample = test_data[i * 10]  # Spread out samples
+        audio_tokens = process_audio(sample['audio_features'])
+        caption = generate_caption(audio_tokens, temperature=0.3)
+        print(f"\nAudio {i+1}:")
+        print(f"  Reference: {sample['caption'][:60]}...")
+        print(f"  Generated: {caption[:60]}...")
+    
+    print("\n" + "=" * 60)
+    print("TEST 3: Audio vs No-Audio")
+    print("=" * 60)
+    sample = test_data[5]
+    audio_tokens = process_audio(sample['audio_features'])
+    
+    caption_with_audio = generate_caption(audio_tokens, temperature=0.3)
+    caption_without_audio = generate_caption(None, temperature=0.3)
+    
+    print(f"Reference: {sample['caption'][:80]}...")
+    print(f"\nWith Audio:    {caption_with_audio[:80]}...")
+    print(f"Without Audio: {caption_without_audio[:80]}...")
+    
+    if caption_with_audio == caption_without_audio:
+        print("\n⚠️  WARNING: Outputs are IDENTICAL - audio is being IGNORED!")
+    else:
+        print("\n✓ Outputs differ - audio has SOME influence")
+    
+    print("\n" + "=" * 60)
+    print("DIAGNOSIS COMPLETE")
+    print("=" * 60)
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1760,6 +1917,7 @@ def main():
     parser.add_argument("--grpo-alpha", type=float, default=0.5, help="GRPO reward alpha (CIDEr weight)")
     parser.add_argument("--grpo-generations", type=int, default=4, help="Generations per sample in GRPO")
     parser.add_argument("--only-grpo", action="store_true", help="Only run GRPO training")
+    parser.add_argument("--diagnose", action="store_true", help="Run audio influence diagnostic")
     
     parser.add_argument("--use-wandb", action="store_true", help="Enable W&B logging")
     
@@ -1776,6 +1934,11 @@ def main():
                 if "=" in line and not line.startswith("#"):
                     key, value = line.strip().split("=", 1)
                     os.environ[key] = value
+    
+    # Diagnostic mode
+    if args.diagnose:
+        diagnose_audio_influence()
+        return
     
     # Step 0: Install packages
     if not args.skip_install:
