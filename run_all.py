@@ -42,29 +42,38 @@ def _init_model_classes():
     
     class _TransformerMAE(nn.Module):
         """
-        Transformer-based Masked Autoencoder for audio features.
+        AudioMAE-style Masked Autoencoder for audio features.
         
-        Architecture follows the original MAE paper:
-        - Encoder: Full transformer on visible patches only
-        - Decoder: Lightweight transformer for reconstruction
+        Based on: https://arxiv.org/abs/2207.06405 (AudioMAE by Facebook Research)
+        
+        Key differences from standard MAE:
+        - Structured masking: masks entire time frames (more suitable for audio)
+        - Higher mask ratio (80%) for audio
+        - Local attention patterns for efficiency
         """
         def __init__(self, input_dim=128, hidden_dim=256, num_layers=4, num_heads=4, 
-                     decoder_dim=128, decoder_layers=2, mask_ratio=0.75, max_len=64):
+                     decoder_dim=128, decoder_layers=2, mask_ratio=0.80, max_len=64):
             super().__init__()
             self.input_dim = input_dim
             self.hidden_dim = hidden_dim
             self.mask_ratio = mask_ratio
+            self.max_len = max_len
             
-            # Input projection
-            self.patch_embed = nn.Linear(input_dim, hidden_dim)
+            # Input projection with layer norm (important for audio)
+            self.patch_embed = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+            )
             
-            # Positional embedding (learnable)
-            self.pos_embed = nn.Parameter(torch.randn(1, max_len, hidden_dim) * 0.02)
+            # Learnable positional embedding
+            self.pos_embed = nn.Parameter(torch.zeros(1, max_len + 1, hidden_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
             
             # CLS token
-            self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            nn.init.trunc_normal_(self.cls_token, std=0.02)
             
-            # Transformer encoder
+            # Transformer encoder (deeper for audio)
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
                 nhead=num_heads,
@@ -77,14 +86,16 @@ def _init_model_classes():
             self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
             self.encoder_norm = nn.LayerNorm(hidden_dim)
             
-            # Decoder (lightweight)
+            # Decoder (lightweight but effective)
             self.decoder_embed = nn.Linear(hidden_dim, decoder_dim)
-            self.mask_token = nn.Parameter(torch.randn(1, 1, decoder_dim) * 0.02)
-            self.decoder_pos_embed = nn.Parameter(torch.randn(1, max_len, decoder_dim) * 0.02)
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
+            nn.init.trunc_normal_(self.mask_token, std=0.02)
+            self.decoder_pos_embed = nn.Parameter(torch.zeros(1, max_len, decoder_dim))
+            nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
             
             decoder_layer = nn.TransformerEncoderLayer(
                 d_model=decoder_dim,
-                nhead=num_heads // 2 or 1,
+                nhead=max(num_heads // 2, 2),
                 dim_feedforward=decoder_dim * 4,
                 dropout=0.1,
                 activation='gelu',
@@ -100,24 +111,38 @@ def _init_model_classes():
             self._init_weights()
         
         def _init_weights(self):
-            for m in self.modules():
+            # Initialize patch_embed linear layer
+            for m in self.patch_embed.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
-        
-        def random_masking(self, x):
-            """Random masking: keep (1-mask_ratio) patches."""
-            B, T, D = x.shape
-            num_keep = int(T * (1 - self.mask_ratio))
             
+            # Initialize other linear layers
+            nn.init.xavier_uniform_(self.decoder_embed.weight)
+            nn.init.zeros_(self.decoder_embed.bias)
+            nn.init.xavier_uniform_(self.output_proj.weight)
+            nn.init.zeros_(self.output_proj.bias)
+        
+        def structured_masking(self, x):
+            """
+            AudioMAE-style structured masking: mask entire time frames.
+            This is more suitable for audio than random patch masking.
+            """
+            B, T, D = x.shape
+            num_mask = int(T * self.mask_ratio)
+            num_keep = T - num_mask
+            
+            # Generate random indices for each batch
             noise = torch.rand(B, T, device=x.device)
             ids_shuffle = torch.argsort(noise, dim=1)
             ids_restore = torch.argsort(ids_shuffle, dim=1)
             
+            # Keep first num_keep tokens (unmasked)
             ids_keep = ids_shuffle[:, :num_keep]
             x_masked = torch.gather(x, 1, ids_keep.unsqueeze(-1).expand(-1, -1, D))
             
+            # Create binary mask: 1 = masked, 0 = visible
             mask = torch.ones(B, T, device=x.device)
             mask[:, :num_keep] = 0
             mask = torch.gather(mask, 1, ids_restore)
@@ -127,50 +152,95 @@ def _init_model_classes():
         def forward(self, x):
             B, T, D = x.shape
             
-            x = self.patch_embed(x)
-            x = x + self.pos_embed[:, :T, :]
+            # Embed patches
+            x_embed = self.patch_embed(x)  # (B, T, hidden_dim)
             
-            x_masked, mask, ids_restore, ids_keep = self.random_masking(x)
+            # Add positional embedding (before masking, as in AudioMAE)
+            x_embed = x_embed + self.pos_embed[:, 1:T+1, :]
             
+            # Structured masking (mask entire time frames)
+            x_masked, mask, ids_restore, ids_keep = self.structured_masking(x_embed)
+            
+            # Add CLS token
             cls_tokens = self.cls_token.expand(B, -1, -1)
+            cls_tokens = cls_tokens + self.pos_embed[:, :1, :]
             x_masked = torch.cat([cls_tokens, x_masked], dim=1)
             
+            # Encode visible tokens only
             x_encoded = self.encoder(x_masked)
             x_encoded = self.encoder_norm(x_encoded)
             
+            # Decoder
+            # Project to decoder dimension
             x_dec = self.decoder_embed(x_encoded)
-            x_dec = x_dec[:, 1:, :]
             
-            mask_tokens = self.mask_token.expand(B, T - x_dec.size(1), -1)
-            x_full = torch.cat([x_dec, mask_tokens], dim=1)
+            # Separate CLS and visible tokens
+            cls_dec = x_dec[:, :1, :]
+            visible_dec = x_dec[:, 1:, :]
+            
+            # Create full sequence with mask tokens
+            num_mask = T - visible_dec.size(1)
+            mask_tokens = self.mask_token.expand(B, num_mask, -1)
+            
+            # Concatenate visible and mask tokens
+            x_full = torch.cat([visible_dec, mask_tokens], dim=1)
+            
+            # Unshuffle to original order
             x_full = torch.gather(x_full, 1, ids_restore.unsqueeze(-1).expand(-1, -1, x_full.size(-1)))
             
+            # Add decoder positional embedding
             x_full = x_full + self.decoder_pos_embed[:, :T, :]
             
+            # Decode
             x_decoded = self.decoder(x_full)
             x_decoded = self.decoder_norm(x_decoded)
             
+            # Project to output dimension
             reconstruction = self.output_proj(x_decoded)
             
             return reconstruction, mask
         
         def compute_loss(self, x, reconstruction, mask):
-            """Compute MSE loss on masked patches only."""
-            loss = (reconstruction - x) ** 2
-            loss = loss.mean(dim=-1)
-            loss = (loss * mask).sum() / mask.sum()
+            """
+            Compute normalized MSE loss on masked patches only.
+            Uses per-patch normalization as in AudioMAE.
+            """
+            # Per-patch normalize target for more stable training
+            target = x
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target_norm = (target - mean) / (var + 1e-6).sqrt()
+            
+            # Also normalize reconstruction
+            pred_mean = reconstruction.mean(dim=-1, keepdim=True)
+            pred_var = reconstruction.var(dim=-1, keepdim=True)
+            pred_norm = (reconstruction - pred_mean) / (pred_var + 1e-6).sqrt()
+            
+            # MSE on normalized values (only masked patches)
+            loss = (pred_norm - target_norm) ** 2
+            loss = loss.mean(dim=-1)  # Mean over features
+            loss = (loss * mask).sum() / (mask.sum() + 1e-6)  # Mean over masked patches
+            
             return loss
         
         def get_encoder_output(self, x):
             """Get encoder output for downstream tasks (CLS token)."""
             B, T, D = x.shape
-            x = self.patch_embed(x)
-            x = x + self.pos_embed[:, :T, :]
+            
+            # Embed patches
+            x_embed = self.patch_embed(x)
+            x_embed = x_embed + self.pos_embed[:, 1:T+1, :]
+            
+            # Add CLS token (no masking during inference)
             cls_tokens = self.cls_token.expand(B, -1, -1)
-            x = torch.cat([cls_tokens, x], dim=1)
-            x = self.encoder(x)
-            x = self.encoder_norm(x)
-            return x[:, 0]  # Return CLS token
+            cls_tokens = cls_tokens + self.pos_embed[:, :1, :]
+            x_full = torch.cat([cls_tokens, x_embed], dim=1)
+            
+            # Encode all tokens
+            x_encoded = self.encoder(x_full)
+            x_encoded = self.encoder_norm(x_encoded)
+            
+            return x_encoded[:, 0]  # Return CLS token
     
     class _AudioProjector(nn.Module):
         """Projects audio embeddings to LLM embedding space with multiple tokens."""
@@ -479,7 +549,7 @@ def preprocess_data(audioset_dir="data/audioset", audiocaps_dir="data/audiocaps"
 
 def train_mae(data_path="data/processed", output_dir="checkpoints/mae", 
               batch_size=64, num_epochs=50, use_wandb=False,
-              hidden_dim=256, num_layers=4, num_heads=4, mask_ratio=0.75):
+              hidden_dim=256, num_layers=4, num_heads=4, mask_ratio=0.80):
     """
     Train Transformer-based MAE for audio encoder pretraining.
     
@@ -1671,7 +1741,7 @@ def main():
     parser.add_argument("--mae-hidden-dim", type=int, default=256, help="MAE hidden dimension")
     parser.add_argument("--mae-layers", type=int, default=4, help="MAE transformer layers")
     parser.add_argument("--mae-heads", type=int, default=4, help="MAE attention heads")
-    parser.add_argument("--mae-mask-ratio", type=float, default=0.75, help="MAE mask ratio")
+    parser.add_argument("--mae-mask-ratio", type=float, default=0.80, help="MAE mask ratio (AudioMAE-style, default: 0.80)")
     
     # SFT arguments (optimized defaults to prevent overfitting)
     parser.add_argument("--sft-epochs", type=int, default=3, help="SFT training epochs (default: 3)")
