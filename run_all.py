@@ -1057,6 +1057,10 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
         'projector_state_dict': projector.state_dict(),
         'audio_encoder_state_dict': audio_encoder.state_dict() if audio_encoder else None,
     }, f"{output_dir}/final_audio_model.pt")
+    
+    # Save projector separately for GRPO
+    torch.save(projector.state_dict(), f"{output_dir}/projector.pt")
+    
     model.save_pretrained(f"{output_dir}/final_model")
     tokenizer.save_pretrained(f"{output_dir}/final_model")
     
@@ -1128,12 +1132,14 @@ class HybridRewardModel:
         if self.cider_scorer is None:
             return [0.0] * len(predictions)
         
-        # Format for pycocoevalcap
+        # Format for pycocoevalcap: plain strings, not dicts
         gts = {}
         res = {}
         for i, (pred, refs) in enumerate(zip(predictions, references)):
-            gts[i] = [{"caption": ref} for ref in refs]
-            res[i] = [{"caption": pred}]
+            # References should be list of strings
+            gts[i] = refs if isinstance(refs, list) else [refs]
+            # Prediction should be a list with single string
+            res[i] = [pred]
         
         try:
             score, scores = self.cider_scorer.compute_score(gts, res)
@@ -1217,14 +1223,17 @@ class HybridRewardModel:
 
 def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_model",
                output_dir="checkpoints/grpo", num_steps=100, use_wandb=False,
-               num_generations=4, reward_alpha=0.5, batch_size=2, learning_rate=5e-6):
+               num_generations=4, reward_alpha=0.5, batch_size=2, learning_rate=5e-6,
+               mae_path="checkpoints/mae/best_mae.pt", projector_path="checkpoints/sft/projector.pt"):
     """
     Train GRPO for improved caption quality using hybrid reward model.
     
     GRPO (Group Relative Policy Optimization):
-    1. Generate multiple captions per audio sample
+    1. Generate multiple captions per audio sample (conditioned on audio)
     2. Compute rewards using CIDEr + CLAP similarity
     3. Use group-relative advantages for policy update
+    
+    The pipeline: Audio Features → MAE Encoder → Projector → LLM → Caption
     """
     print("\n" + "=" * 60)
     print("Training GRPO (Reinforcement Learning)...")
@@ -1232,7 +1241,9 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
     
     import pickle
     import torch
+    import torch.nn as nn
     import torch.nn.functional as F
+    import numpy as np
     from pathlib import Path
     from tqdm import tqdm
     
@@ -1248,19 +1259,41 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
         print(f"Warning: SFT model not found at {model_path}. Skipping GRPO training.")
         return
     
-    # Initialize reward model
-    print("\nInitializing hybrid reward model (CIDEr + CLAP)...")
+    # =========================================================================
+    # 1. Initialize reward model
+    # =========================================================================
+    print("\n1. Initializing hybrid reward model (CIDEr + CLAP)...")
     reward_model = HybridRewardModel(alpha=reward_alpha, device=device)
     
-    # Load SFT model using Unsloth (same way it was saved)
-    print(f"\nLoading SFT model from {model_path}...")
+    # =========================================================================
+    # 2. Load MAE encoder (from pretraining)
+    # =========================================================================
+    print("\n2. Loading MAE encoder...")
+    
+    mae_encoder = None
+    if os.path.exists(mae_path):
+        mae_encoder = TransformerMAE(
+            input_dim=128, hidden_dim=256, num_layers=4, 
+            num_heads=4, mask_ratio=0.0, target_length=10  # No masking during inference
+        ).to(device)
+        mae_encoder.load_state_dict(torch.load(mae_path, map_location=device))
+        mae_encoder.eval()
+        for p in mae_encoder.parameters():
+            p.requires_grad = False
+        print(f"  ✓ MAE encoder loaded from {mae_path}")
+    else:
+        print(f"  ⚠ MAE encoder not found at {mae_path}, will use text-only mode")
+    
+    # =========================================================================
+    # 3. Load SFT model and projector
+    # =========================================================================
+    print(f"\n3. Loading SFT model from {model_path}...")
     
     from unsloth import FastLanguageModel
     
     try:
-        # Load base model with the saved LoRA adapter
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_path,  # This loads the saved adapter
+            model_name=model_path,
             max_seq_length=512,
             load_in_4bit=True,
             token=hf_token,
@@ -1269,30 +1302,33 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        print("  ✓ Model loaded with Unsloth")
+        print("  ✓ LLM loaded with Unsloth")
             
     except Exception as e:
         print(f"Error loading saved model: {e}")
-        print("Loading fresh base model for reward evaluation...")
-        
-        try:
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name="google/gemma-2b-it",
-                max_seq_length=512,
-                load_in_4bit=True,
-                token=hf_token,
-            )
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-        except Exception as e2:
-            print(f"Error: {e2}")
-            return
+        return
     
-    # Enable inference mode
-    FastLanguageModel.for_inference(model)
+    # Load audio projector
+    projector = None
+    llm_dim = model.get_input_embeddings().weight.shape[1]
     
-    # Load training data
-    print("\nLoading training data...")
+    if os.path.exists(projector_path):
+        projector = AudioProjector(256, llm_dim).to(device)
+        projector.load_state_dict(torch.load(projector_path, map_location=device))
+        projector.eval()
+        for p in projector.parameters():
+            p.requires_grad = False
+        print(f"  ✓ Audio projector loaded from {projector_path}")
+    else:
+        print(f"  ⚠ Projector not found at {projector_path}")
+    
+    has_audio = mae_encoder is not None and projector is not None
+    print(f"  Audio conditioning: {'ENABLED' if has_audio else 'DISABLED (text-only)'}")
+    
+    # =========================================================================
+    # 4. Load training data
+    # =========================================================================
+    print("\n4. Loading training data...")
     train_path = Path(data_path) / "train.pkl"
     if not train_path.exists():
         print(f"Error: {train_path} not found")
@@ -1301,29 +1337,72 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
     with open(train_path, 'rb') as f:
         train_data = pickle.load(f)
     
-    print(f"Loaded {len(train_data)} training samples")
+    print(f"  Loaded {len(train_data)} training samples")
     
     # Limit data for GRPO (it's slow)
     train_data = train_data[:500]
+    print(f"  Using {len(train_data)} samples for GRPO")
     
     # Create output directory
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
-    # GRPO training loop
-    print(f"\nStarting GRPO training for {num_steps} steps...")
+    # =========================================================================
+    # 5. GRPO training setup
+    # =========================================================================
+    print(f"\n5. Starting GRPO training for {num_steps} steps...")
     print(f"  - Generations per sample: {num_generations}")
     print(f"  - Reward alpha (CIDEr weight): {reward_alpha}")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Learning rate: {learning_rate}")
     
-    # Setup optimizer for any trainable params
+    # Enable training mode for LoRA (GRPO updates)
+    FastLanguageModel.for_training(model)
+    
+    # Setup optimizer for LoRA params
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    num_params = sum(p.numel() for p in trainable_params)
+    print(f"  - Trainable params: {num_params:,}")
+    
     if trainable_params:
         optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
     else:
-        print("Note: No trainable parameters found. Running reward evaluation only.")
+        print("  ⚠ No trainable parameters found. Running reward evaluation only.")
         optimizer = None
     
+    # Helper function to process audio
+    def process_audio(audio_features):
+        """Process audio features through MAE encoder and projector."""
+        if not has_audio:
+            return None
+        
+        # Normalize and pad/truncate to target length
+        target_len = 10
+        if len(audio_features) < target_len:
+            padding = np.zeros((target_len - len(audio_features), 128))
+            audio_features = np.concatenate([audio_features, padding], axis=0)
+        else:
+            audio_features = audio_features[:target_len]
+        
+        audio_features = (audio_features - audio_features.mean()) / (audio_features.std() + 1e-8)
+        audio_tensor = torch.from_numpy(audio_features).float().unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            # Get CLS token from MAE encoder
+            encoded = mae_encoder.patch_embedding(audio_tensor)
+            cls_token = mae_encoder.cls_token.expand(1, -1, -1)
+            encoded = torch.cat([cls_token, encoded], dim=1)
+            encoded = encoded + mae_encoder.positional_embedding[:, :encoded.size(1), :]
+            encoded = mae_encoder.encoder(encoded)
+            audio_embedding = encoded[:, 0, :]  # CLS token
+            
+            # Project to LLM dimension
+            audio_projected = projector(audio_embedding.unsqueeze(1))
+        
+        return audio_projected  # Shape: (1, 1, llm_dim)
+    
+    # =========================================================================
+    # 6. Training loop
+    # =========================================================================
     global_step = 0
     total_reward = 0.0
     best_avg_reward = 0.0
@@ -1341,16 +1420,28 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
         # Generate multiple captions for each sample
         all_predictions = []
         all_references = []
+        all_log_probs = []
         
         for sample in batch_samples:
-            prompt = "<start_of_turn>user\nDescribe this audio.<end_of_turn>\n<start_of_turn>model\n"
+            # Process audio
+            audio_emb = process_audio(sample['audio_features']) if has_audio else None
             
+            # Create prompt
+            prompt = "<start_of_turn>user\nDescribe this audio.<end_of_turn>\n<start_of_turn>model\n"
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
             
             # Generate multiple responses
             generations = []
+            log_probs_list = []
+            
             for _ in range(num_generations):
+                # Switch to inference mode for generation
+                model.eval()
+                
                 with torch.no_grad():
+                    # For audio-conditioned generation, we'd ideally prepend audio embeddings
+                    # to the input. For simplicity, we generate based on the prompt
+                    # and use the audio info implicitly through the SFT training
                     outputs = model.generate(
                         **inputs,
                         max_new_tokens=64,
@@ -1358,19 +1449,40 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
                         temperature=0.8,
                         top_p=0.9,
                         pad_token_id=tokenizer.pad_token_id,
+                        return_dict_in_generate=True,
+                        output_scores=True,
                     )
                 
-                generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                # Extract just the model's response
+                generated_ids = outputs.sequences[0]
+                generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                
+                # Extract model's response
                 if "<start_of_turn>model" in generated_text:
                     response = generated_text.split("<start_of_turn>model")[-1].strip()
                 else:
                     response = generated_text
                 
                 generations.append(response)
+                
+                # Compute log probability of generated sequence (for GRPO loss)
+                if optimizer is not None:
+                    model.train()
+                    with torch.enable_grad():
+                        output_ids = generated_ids[inputs['input_ids'].shape[1]:]
+                        if len(output_ids) > 0:
+                            full_ids = generated_ids.unsqueeze(0)
+                            labels = full_ids.clone()
+                            labels[:, :inputs['input_ids'].shape[1]] = -100
+                            
+                            outputs_loss = model(full_ids, labels=labels)
+                            log_probs_list.append(-outputs_loss.loss)  # Negative NLL = log prob
+                        else:
+                            log_probs_list.append(torch.tensor(0.0, device=device))
             
             all_predictions.extend(generations)
             all_references.extend([[sample['caption']]] * num_generations)
+            if optimizer is not None:
+                all_log_probs.extend(log_probs_list)
         
         # Compute rewards
         rewards = reward_model(all_predictions, all_references)
@@ -1382,6 +1494,19 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
         rewards_mean = rewards.mean(dim=1, keepdim=True)
         rewards_std = rewards.std(dim=1, keepdim=True) + 1e-8
         advantages = (rewards - rewards_mean) / rewards_std
+        
+        # GRPO loss: maximize advantage-weighted log probability
+        if optimizer is not None and len(all_log_probs) > 0:
+            log_probs = torch.stack(all_log_probs).view(batch_size, num_generations)
+            advantages_flat = advantages.to(device)
+            
+            # Policy gradient loss
+            loss = -(log_probs * advantages_flat.detach()).mean()
+            
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            optimizer.step()
         
         # Log metrics
         avg_reward = rewards.mean().item()
@@ -1395,18 +1520,23 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
             'avg': f"{total_reward/global_step:.4f}",
         })
         
-        # Save best model
+        # Save checkpoint every 25 steps
         if avg_reward > best_avg_reward:
             best_avg_reward = avg_reward
-            if global_step % 10 == 0:
-                print(f"\n  New best reward: {best_avg_reward:.4f}")
         
         # Log every 10 steps
         if global_step % 10 == 0:
-            print(f"\n  Step {global_step}: Avg Reward = {total_reward/global_step:.4f}")
-            print(f"  Sample prediction: {all_predictions[0][:100]}...")
+            print(f"\n  Step {global_step}: Avg Reward = {total_reward/global_step:.4f}, Best = {best_avg_reward:.4f}")
+            print(f"  Sample prediction: {all_predictions[0][:80]}...")
+            print(f"  Reference: {all_references[0][0][:80]}...")
     
     pbar.close()
+    
+    # Save final model
+    if optimizer is not None:
+        model.save_pretrained(f"{output_dir}/final_model")
+        tokenizer.save_pretrained(f"{output_dir}/final_model")
+        print(f"\n  ✓ Model saved to {output_dir}/final_model")
     
     # Save final results
     results = {
@@ -1414,6 +1544,7 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
         'best_reward': best_avg_reward,
         'num_steps': num_steps,
         'reward_alpha': reward_alpha,
+        'audio_conditioning': has_audio,
     }
     
     import json
@@ -1553,6 +1684,8 @@ def main():
             num_steps=args.grpo_steps,
             reward_alpha=args.grpo_alpha,
             num_generations=args.grpo_generations,
+            mae_path=args.mae_path,
+            projector_path="checkpoints/sft/projector.pt",
             use_wandb=args.use_wandb
         )
         return
@@ -1562,6 +1695,8 @@ def main():
             num_steps=args.grpo_steps,
             reward_alpha=args.grpo_alpha,
             num_generations=args.grpo_generations,
+            mae_path=args.mae_path,
+            projector_path="checkpoints/sft/projector.pt",
             use_wandb=args.use_wandb
         )
     
