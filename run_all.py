@@ -1470,6 +1470,68 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_mode
         all_references = []
         all_log_probs = []
         
+        # Custom autoregressive generation with audio embeddings
+        def generate_with_audio(audio_tokens, prompt_ids, max_new_tokens=64, temperature=0.8, top_p=0.9):
+            """Generate text autoregressively with audio tokens prepended."""
+            model.eval()
+            embed_tokens = model.get_input_embeddings()
+            
+            # Get initial embeddings
+            text_embeds = embed_tokens(prompt_ids)  # (1, seq_len, llm_dim)
+            
+            if audio_tokens is not None:
+                # Concatenate: [AUDIO_TOKENS] + [TEXT_TOKENS]
+                inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
+                num_audio_toks = audio_tokens.size(1)
+            else:
+                inputs_embeds = text_embeds
+                num_audio_toks = 0
+            
+            # Track generated token ids
+            generated_ids = prompt_ids.clone()
+            
+            # Autoregressive generation loop
+            past_key_values = None
+            for _ in range(max_new_tokens):
+                with torch.no_grad():
+                    if past_key_values is None:
+                        # First forward pass with full inputs_embeds
+                        outputs = model(inputs_embeds=inputs_embeds, use_cache=True)
+                        past_key_values = outputs.past_key_values
+                    else:
+                        # Subsequent passes: only pass the last generated token
+                        last_token_embed = embed_tokens(generated_ids[:, -1:])
+                        outputs = model(inputs_embeds=last_token_embed, 
+                                       past_key_values=past_key_values, 
+                                       use_cache=True)
+                        past_key_values = outputs.past_key_values
+                    
+                    # Get logits for the last position
+                    logits = outputs.logits[:, -1, :] / temperature
+                    
+                    # Top-p sampling
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                    sorted_indices_to_remove[:, 0] = 0
+                    
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = float('-inf')
+                    
+                    # Sample
+                    probs = F.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    
+                    # Append to generated ids
+                    generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                    
+                    # Stop if EOS token
+                    if next_token.item() == tokenizer.eos_token_id:
+                        break
+            
+            return generated_ids[0]  # Return (seq_len,) tensor
+        
         for sample in batch_samples:
             # Process audio
             audio_tokens = process_audio(sample['audio_features']) if has_audio else None
@@ -1477,60 +1539,30 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_mode
             # Create prompt
             prompt = "<start_of_turn>user\nDescribe this audio.<end_of_turn>\n<start_of_turn>model\n"
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            prompt_len = inputs['input_ids'].size(1)
             
             # Generate multiple responses
             generations = []
             log_probs_list = []
             
             for _ in range(num_generations):
-                # Switch to inference mode for generation
-                model.eval()
+                # Generate with audio-conditioned custom function
+                generated_ids = generate_with_audio(
+                    audio_tokens, 
+                    inputs['input_ids'],
+                    max_new_tokens=64,
+                    temperature=0.8,
+                    top_p=0.9
+                )
                 
-                with torch.no_grad():
-                    # FIXED: Prepend audio embeddings to text for audio-conditioned generation
-                    if audio_tokens is not None:
-                        # Get text embeddings
-                        embed_tokens = model.get_input_embeddings()
-                        text_embeds = embed_tokens(inputs['input_ids'])  # (1, seq_len, llm_dim)
-                        
-                        # Concatenate: [AUDIO_TOKENS] + [TEXT_TOKENS]
-                        inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
-                        
-                        # Extend attention mask
-                        num_audio_toks = audio_tokens.size(1)
-                        audio_mask = torch.ones(1, num_audio_toks, device=device, dtype=inputs['attention_mask'].dtype)
-                        attention_mask = torch.cat([audio_mask, inputs['attention_mask']], dim=1)
-                        
-                        outputs = model.generate(
-                            inputs_embeds=inputs_embeds,
-                            attention_mask=attention_mask,
-                            max_new_tokens=64,
-                            do_sample=True,
-                            temperature=0.8,
-                            top_p=0.9,
-                            pad_token_id=tokenizer.pad_token_id,
-                            return_dict_in_generate=True,
-                            output_scores=True,
-                        )
-                    else:
-                        # Fallback: text-only generation
-                        outputs = model.generate(
-                            **inputs,
-                            max_new_tokens=64,
-                            do_sample=True,
-                            temperature=0.8,
-                            top_p=0.9,
-                            pad_token_id=tokenizer.pad_token_id,
-                            return_dict_in_generate=True,
-                            output_scores=True,
-                        )
-                
-                generated_ids = outputs.sequences[0]
                 generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
                 
                 # Extract model's response
                 if "<start_of_turn>model" in generated_text:
                     response = generated_text.split("<start_of_turn>model")[-1].strip()
+                    # Clean up any end tokens
+                    if "<end_of_turn>" in response:
+                        response = response.split("<end_of_turn>")[0].strip()
                 else:
                     response = generated_text
                 
@@ -1540,11 +1572,11 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_mode
                 if optimizer is not None:
                     model.train()
                     with torch.enable_grad():
-                        output_ids = generated_ids[inputs['input_ids'].shape[1]:]
+                        output_ids = generated_ids[prompt_len:]
                         if len(output_ids) > 0:
                             full_ids = generated_ids.unsqueeze(0)
                             labels = full_ids.clone()
-                            labels[:, :inputs['input_ids'].shape[1]] = -100
+                            labels[:, :prompt_len] = -100
                             
                             outputs_loss = model(full_ids, labels=labels)
                             log_probs_list.append(-outputs_loss.loss)  # Negative NLL = log prob
