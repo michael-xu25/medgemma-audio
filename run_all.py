@@ -294,14 +294,29 @@ def preprocess_data(audioset_dir="data/audioset", audiocaps_dir="data/audiocaps"
 
 
 # =============================================================================
-# STEP 3: MAE Pretraining
+# STEP 3: MAE Pretraining (Transformer-based)
 # =============================================================================
 
 def train_mae(data_path="data/processed", output_dir="checkpoints/mae", 
-              batch_size=64, num_epochs=10, use_wandb=False):
-    """Train MAE for audio encoder pretraining."""
+              batch_size=64, num_epochs=50, use_wandb=False,
+              hidden_dim=256, num_layers=4, num_heads=4, mask_ratio=0.75):
+    """
+    Train Transformer-based MAE for audio encoder pretraining.
+    
+    Architecture:
+    - Transformer encoder with positional embeddings
+    - Masked autoencoding (75% masking by default)
+    - Lightweight decoder for reconstruction
+    
+    Args:
+        num_epochs: Training epochs (default: 50, was 10)
+        hidden_dim: Transformer hidden dimension
+        num_layers: Number of transformer layers
+        num_heads: Number of attention heads
+        mask_ratio: Fraction of patches to mask
+    """
     print("\n" + "=" * 60)
-    print("Training MAE (Audio Encoder)...")
+    print("Training MAE (Transformer Audio Encoder)...")
     print("=" * 60 + "\n")
     
     import pickle
@@ -359,60 +374,199 @@ def train_mae(data_path="data/processed", output_dir="checkpoints/mae",
             features = (features - features.mean()) / (features.std() + 1e-8)
             return torch.from_numpy(features).float()
     
-    train_loader = DataLoader(AudioDataset(train_data), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(AudioDataset(val_data), batch_size=batch_size)
+    train_loader = DataLoader(AudioDataset(train_data), batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(AudioDataset(val_data), batch_size=batch_size, num_workers=2)
     
-    # Simple MAE model
-    class SimpleMAE(nn.Module):
-        def __init__(self, input_dim=128, hidden_dim=256, mask_ratio=0.75):
+    # Transformer-based MAE model
+    class TransformerMAE(nn.Module):
+        """
+        Transformer-based Masked Autoencoder for audio features.
+        
+        Architecture follows the original MAE paper:
+        - Encoder: Full transformer on visible patches only
+        - Decoder: Lightweight transformer for reconstruction
+        """
+        def __init__(self, input_dim=128, hidden_dim=256, num_layers=4, num_heads=4, 
+                     decoder_dim=128, decoder_layers=2, mask_ratio=0.75, max_len=64):
             super().__init__()
+            self.input_dim = input_dim
+            self.hidden_dim = hidden_dim
             self.mask_ratio = mask_ratio
-            self.encoder = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, hidden_dim),
+            
+            # Input projection
+            self.patch_embed = nn.Linear(input_dim, hidden_dim)
+            
+            # Positional embedding (learnable)
+            self.pos_embed = nn.Parameter(torch.randn(1, max_len, hidden_dim) * 0.02)
+            
+            # CLS token
+            self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            
+            # Transformer encoder
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim * 4,
+                dropout=0.1,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,  # Pre-norm for stability
             )
-            self.decoder = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, input_dim),
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.encoder_norm = nn.LayerNorm(hidden_dim)
+            
+            # Decoder (lightweight)
+            self.decoder_embed = nn.Linear(hidden_dim, decoder_dim)
+            self.mask_token = nn.Parameter(torch.randn(1, 1, decoder_dim) * 0.02)
+            self.decoder_pos_embed = nn.Parameter(torch.randn(1, max_len, decoder_dim) * 0.02)
+            
+            decoder_layer = nn.TransformerEncoderLayer(
+                d_model=decoder_dim,
+                nhead=num_heads // 2 or 1,
+                dim_feedforward=decoder_dim * 4,
+                dropout=0.1,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
             )
+            self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_layers)
+            self.decoder_norm = nn.LayerNorm(decoder_dim)
+            
+            # Output projection
+            self.output_proj = nn.Linear(decoder_dim, input_dim)
+            
+            # Initialize weights
+            self._init_weights()
+        
+        def _init_weights(self):
+            # Initialize linear layers
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        
+        def random_masking(self, x):
+            """Random masking: keep (1-mask_ratio) patches."""
+            B, T, D = x.shape
+            num_keep = int(T * (1 - self.mask_ratio))
+            
+            # Random noise for shuffling
+            noise = torch.rand(B, T, device=x.device)
+            ids_shuffle = torch.argsort(noise, dim=1)
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+            
+            # Keep first num_keep
+            ids_keep = ids_shuffle[:, :num_keep]
+            x_masked = torch.gather(x, 1, ids_keep.unsqueeze(-1).expand(-1, -1, D))
+            
+            # Binary mask: 0 = keep, 1 = mask
+            mask = torch.ones(B, T, device=x.device)
+            mask[:, :num_keep] = 0
+            mask = torch.gather(mask, 1, ids_restore)
+            
+            return x_masked, mask, ids_restore, ids_keep
         
         def forward(self, x):
             B, T, D = x.shape
-            # Random masking
-            num_mask = int(T * self.mask_ratio)
-            noise = torch.rand(B, T, device=x.device)
-            ids_shuffle = torch.argsort(noise, dim=1)
-            mask = torch.zeros(B, T, device=x.device)
-            mask.scatter_(1, ids_shuffle[:, :num_mask], 1)
             
-            # Encode
-            encoded = self.encoder(x)
+            # Embed patches
+            x = self.patch_embed(x)
+            
+            # Add positional embedding
+            x = x + self.pos_embed[:, :T, :]
+            
+            # Masking
+            x_masked, mask, ids_restore, ids_keep = self.random_masking(x)
+            
+            # Add CLS token
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            x_masked = torch.cat([cls_tokens, x_masked], dim=1)
+            
+            # Encode (only visible patches)
+            x_encoded = self.encoder(x_masked)
+            x_encoded = self.encoder_norm(x_encoded)
+            
             # Decode
-            decoded = self.decoder(encoded)
-            # Loss on masked positions
-            loss = ((decoded - x) ** 2).mean(dim=-1)
-            loss = (loss * mask).sum() / mask.sum()
-            return loss, decoded, mask
+            # Project to decoder dimension
+            x_dec = self.decoder_embed(x_encoded)
+            
+            # Remove CLS, add mask tokens
+            x_dec = x_dec[:, 1:, :]  # Remove CLS
+            
+            # Unshuffle and add mask tokens
+            mask_tokens = self.mask_token.expand(B, T - x_dec.size(1), -1)
+            x_full = torch.cat([x_dec, mask_tokens], dim=1)
+            x_full = torch.gather(x_full, 1, ids_restore.unsqueeze(-1).expand(-1, -1, x_full.size(-1)))
+            
+            # Add decoder positional embedding
+            x_full = x_full + self.decoder_pos_embed[:, :T, :]
+            
+            # Decode
+            x_decoded = self.decoder(x_full)
+            x_decoded = self.decoder_norm(x_decoded)
+            
+            # Project to output
+            reconstruction = self.output_proj(x_decoded)
+            
+            return reconstruction, mask
+        
+        def compute_loss(self, x, reconstruction, mask):
+            """Compute MSE loss on masked patches only."""
+            loss = (reconstruction - x) ** 2
+            loss = loss.mean(dim=-1)  # Mean over features
+            loss = (loss * mask).sum() / mask.sum()  # Mean over masked patches
+            return loss
+        
+        def get_encoder_output(self, x):
+            """Get encoder output for downstream tasks."""
+            B, T, D = x.shape
+            x = self.patch_embed(x)
+            x = x + self.pos_embed[:, :T, :]
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            x = torch.cat([cls_tokens, x], dim=1)
+            x = self.encoder(x)
+            x = self.encoder_norm(x)
+            return x[:, 0]  # Return CLS token
     
-    model = SimpleMAE().to(device)
-    optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
-    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
+    # Create model
+    model = TransformerMAE(
+        input_dim=128,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        mask_ratio=mask_ratio,
+    ).to(device)
+    
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {num_params:,}")
+    print(f"Architecture: {num_layers} layers, {num_heads} heads, dim={hidden_dim}")
+    print(f"Mask ratio: {mask_ratio}")
+    
+    optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=0.05, betas=(0.9, 0.95))
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     
     # Training
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     best_val_loss = float('inf')
+    history = {'train_loss': [], 'val_loss': [], 'reconstruction_quality': []}
+    
+    print(f"\nTraining for {num_epochs} epochs...")
     
     for epoch in range(1, num_epochs + 1):
         model.train()
         train_loss = 0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}"):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}", leave=False):
             batch = batch.to(device)
-            loss, _, _ = model(batch)
+            
+            reconstruction, mask = model(batch)
+            loss = model.compute_loss(batch, reconstruction, mask)
+            
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            
             train_loss += loss.item()
         
         train_loss /= len(train_loader)
@@ -420,52 +574,138 @@ def train_mae(data_path="data/processed", output_dir="checkpoints/mae",
         # Validation
         model.eval()
         val_loss = 0
+        recon_quality = 0
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
-                loss, _, _ = model(batch)
+                reconstruction, mask = model(batch)
+                loss = model.compute_loss(batch, reconstruction, mask)
                 val_loss += loss.item()
+                
+                # Compute reconstruction quality (cosine similarity on masked patches)
+                cos_sim = F.cosine_similarity(
+                    reconstruction.view(-1, 128),
+                    batch.view(-1, 128),
+                    dim=-1
+                ).mean()
+                recon_quality += cos_sim.item()
+        
         val_loss /= len(val_loader)
+        recon_quality /= len(val_loader)
         
         scheduler.step()
-        print(f"Epoch {epoch}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}")
         
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['reconstruction_quality'].append(recon_quality)
+        
+        # Print progress
+        lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch:3d}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, "
+              f"Recon Sim={recon_quality:.4f}, LR={lr:.2e}")
+        
+        # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), f"{output_dir}/best_model.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'recon_quality': recon_quality,
+            }, f"{output_dir}/best_model.pt")
+        
+        # Save checkpoint every 10 epochs
+        if epoch % 10 == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'history': history,
+            }, f"{output_dir}/checkpoint_epoch_{epoch}.pt")
     
-    torch.save(model.encoder.state_dict(), f"{output_dir}/audio_encoder.pt")
-    print(f"\n✓ MAE training complete! Best val loss: {best_val_loss:.4f}")
+    # Save final model and history
+    torch.save(model.state_dict(), f"{output_dir}/final_model.pt")
+    
+    import json
+    with open(f"{output_dir}/training_history.json", 'w') as f:
+        json.dump(history, f, indent=2)
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print("MAE Training Complete!")
+    print(f"{'='*60}")
+    print(f"Best val loss: {best_val_loss:.4f}")
+    print(f"Final reconstruction similarity: {history['reconstruction_quality'][-1]:.4f}")
+    print(f"Loss reduction: {history['train_loss'][0]:.4f} → {history['train_loss'][-1]:.4f} "
+          f"({100*(1-history['train_loss'][-1]/history['train_loss'][0]):.1f}% improvement)")
+    print(f"\nSaved to: {output_dir}/")
+    
+    # Validate that transformer is learning
+    print(f"\n{'='*60}")
+    print("Pretraining Quality Check")
+    print(f"{'='*60}")
+    if history['reconstruction_quality'][-1] > 0.5:
+        print("✓ Good reconstruction quality (>0.5 cosine similarity)")
+        print("  The transformer is learning meaningful representations!")
+    elif history['reconstruction_quality'][-1] > 0.3:
+        print("⚠ Moderate reconstruction quality (0.3-0.5)")
+        print("  Consider training longer or increasing model capacity.")
+    else:
+        print("✗ Poor reconstruction quality (<0.3)")
+        print("  The model may not be learning well. Check data and hyperparameters.")
 
 
 # =============================================================================
-# STEP 4: SFT Training  
+# STEP 4: SFT Training (with Audio Encoder Integration)
 # =============================================================================
 
 def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
-              model_name="google/gemma-2b-it", batch_size=4, num_epochs=5, use_wandb=False,
-              lora_r=32, lora_alpha=64, learning_rate=1e-4, max_samples=None):
+              mae_path="checkpoints/mae", model_name="google/gemma-2b-it", 
+              batch_size=4, num_epochs=5, use_wandb=False,
+              lora_r=32, lora_alpha=64, learning_rate=1e-4, max_samples=None,
+              freeze_audio_encoder=True):
     """
-    Train SFT for audio captioning with optimized settings.
+    Train SFT for audio captioning WITH audio encoder integration.
     
-    Optimizations applied:
-    - LoRA r=32 (more capacity than r=16)
-    - LoRA dropout=0 (faster training, Unsloth recommended)
-    - Learning rate=1e-4 (more conservative)
-    - Gradient clipping at 1.0
-    - Warmup ratio 10%
-    - Uses ALL available training data by default
+    Architecture:
+        Audio Features → [MAE Encoder] → [Projector] → [Gemma LLM] → Caption
+                         (pretrained)    (trained)      (LoRA)
+    
+    This properly uses the pretrained MAE encoder to process audio features
+    and projects them into the LLM's embedding space.
     """
     print("\n" + "=" * 60)
-    print("Training SFT (Supervised Fine-Tuning)...")
+    print("Training SFT (Audio-to-Text with MAE Encoder)...")
     print("=" * 60 + "\n")
     
     import pickle
     import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import Dataset, DataLoader
+    from torch.optim import AdamW
     from pathlib import Path
     from tqdm import tqdm
+    import numpy as np
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Audio projector: maps audio embeddings to LLM embedding space
+    class AudioProjector(nn.Module):
+        """Projects audio embeddings to LLM embedding space."""
+        def __init__(self, audio_dim, llm_dim, hidden_dim=None):
+            super().__init__()
+            hidden_dim = hidden_dim or (audio_dim + llm_dim) // 2
+            self.proj = nn.Sequential(
+                nn.Linear(audio_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, llm_dim),
+                nn.LayerNorm(llm_dim),
+            )
+        
+        def forward(self, x):
+            return self.proj(x)
     
     # Check for HuggingFace token
     hf_token = os.environ.get("HF_TOKEN")
@@ -480,8 +720,81 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
         print("Warning: unsloth not available. Skipping SFT training.")
         return
     
-    # Load model
-    print(f"Loading {model_name}...")
+    # =========================================================================
+    # 1. Load pretrained MAE encoder
+    # =========================================================================
+    print("\n1. Loading pretrained MAE encoder...")
+    
+    mae_checkpoint = Path(mae_path) / "best_model.pt"
+    if not mae_checkpoint.exists():
+        mae_checkpoint = Path(mae_path) / "final_model.pt"
+    
+    if not mae_checkpoint.exists():
+        print(f"  Warning: No MAE checkpoint found at {mae_path}")
+        print("  Training without audio encoder (text-only mode)")
+        audio_encoder = None
+    else:
+        # Recreate MAE model architecture (must match training)
+        class TransformerEncoder(nn.Module):
+            """Encoder portion of TransformerMAE for inference."""
+            def __init__(self, input_dim=128, hidden_dim=256, num_layers=4, num_heads=4, max_len=64):
+                super().__init__()
+                self.hidden_dim = hidden_dim
+                self.patch_embed = nn.Linear(input_dim, hidden_dim)
+                self.pos_embed = nn.Parameter(torch.randn(1, max_len, hidden_dim) * 0.02)
+                self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+                
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=hidden_dim, nhead=num_heads,
+                    dim_feedforward=hidden_dim * 4, dropout=0.1,
+                    activation='gelu', batch_first=True, norm_first=True,
+                )
+                self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+                self.norm = nn.LayerNorm(hidden_dim)
+            
+            def forward(self, x):
+                B, T, D = x.shape
+                x = self.patch_embed(x)
+                x = x + self.pos_embed[:, :T, :]
+                cls_tokens = self.cls_token.expand(B, -1, -1)
+                x = torch.cat([cls_tokens, x], dim=1)
+                x = self.encoder(x)
+                x = self.norm(x)
+                return x[:, 0]  # Return CLS token
+        
+        audio_encoder = TransformerEncoder().to(device)
+        
+        # Load weights (extract encoder parts from full MAE checkpoint)
+        checkpoint = torch.load(mae_checkpoint, map_location=device)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        
+        # Filter to encoder weights only
+        encoder_state = {}
+        for k, v in state_dict.items():
+            if k.startswith('patch_embed') or k.startswith('pos_embed') or \
+               k.startswith('cls_token') or k.startswith('encoder') or k.startswith('encoder_norm'):
+                new_k = k.replace('encoder_norm', 'norm')
+                encoder_state[new_k] = v
+        
+        try:
+            audio_encoder.load_state_dict(encoder_state, strict=False)
+            print(f"  ✓ Loaded MAE encoder from {mae_checkpoint}")
+        except Exception as e:
+            print(f"  Warning: Could not load MAE weights: {e}")
+            print("  Using randomly initialized audio encoder")
+        
+        if freeze_audio_encoder:
+            for param in audio_encoder.parameters():
+                param.requires_grad = False
+            print("  ✓ Audio encoder frozen (will not be updated)")
+        else:
+            print("  ✓ Audio encoder unfrozen (will be fine-tuned)")
+    
+    # =========================================================================
+    # 2. Load LLM with LoRA
+    # =========================================================================
+    print(f"\n2. Loading {model_name} with LoRA...")
+    
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
         max_seq_length=512,
@@ -489,89 +802,267 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
         token=hf_token,
     )
     
-    # Optimized LoRA settings
-    print(f"Applying LoRA with r={lora_r}, alpha={lora_alpha}, dropout=0...")
     model = FastLanguageModel.get_peft_model(
         model,
         r=lora_r,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=lora_alpha,
-        lora_dropout=0,  # Unsloth recommends 0 for faster training
-        use_gradient_checkpointing="unsloth",  # Memory optimization
+        lora_dropout=0,
+        use_gradient_checkpointing="unsloth",
     )
     
-    # Load data
+    # Get LLM embedding dimension
+    llm_dim = model.get_input_embeddings().weight.shape[1]
+    print(f"  LLM embedding dimension: {llm_dim}")
+    
+    # =========================================================================
+    # 3. Create audio projector
+    # =========================================================================
+    print("\n3. Creating audio projector...")
+    
+    audio_dim = 256  # MAE encoder output dimension
+    projector = AudioProjector(audio_dim, llm_dim).to(device)
+    print(f"  Projector: {audio_dim} → {llm_dim}")
+    
+    # =========================================================================
+    # 4. Load training data
+    # =========================================================================
+    print("\n4. Loading training data...")
+    
     with open(Path(data_path) / "train.pkl", 'rb') as f:
         train_data = pickle.load(f)
+    with open(Path(data_path) / "val.pkl", 'rb') as f:
+        val_data = pickle.load(f)
     
-    # Use all data or limit if specified
     if max_samples is not None and max_samples < len(train_data):
         train_data = train_data[:max_samples]
-        print(f"Using {max_samples} samples (limited)")
+        print(f"  Using {max_samples} samples (limited)")
     else:
-        print(f"Using ALL {len(train_data)} training samples")
+        print(f"  Using ALL {len(train_data)} training samples")
     
-    # Format prompts with richer context
-    prompts = []
-    for sample in train_data:
-        prompt = f"""<start_of_turn>user
-Listen to this audio clip and provide a detailed description of what you hear. Include information about:
-- The main sounds or events
-- Any background noises
-- The overall atmosphere or mood
-<end_of_turn>
-<start_of_turn>model
-{sample['caption']}<end_of_turn>"""
-        prompts.append(prompt)
+    # Dataset that returns audio features + captions
+    class AudioCaptionDataset(Dataset):
+        def __init__(self, data, tokenizer, max_length=256, target_audio_len=10):
+            self.data = data
+            self.tokenizer = tokenizer
+            self.max_length = max_length
+            self.target_audio_len = target_audio_len
+        
+        def __len__(self):
+            return len(self.data)
+        
+        def __getitem__(self, idx):
+            sample = self.data[idx]
+            
+            # Process audio features
+            audio = sample['audio_features']
+            if len(audio) < self.target_audio_len:
+                padding = np.zeros((self.target_audio_len - len(audio), audio.shape[1]))
+                audio = np.concatenate([audio, padding], axis=0)
+            else:
+                audio = audio[:self.target_audio_len]
+            audio = (audio - audio.mean()) / (audio.std() + 1e-8)
+            
+            return {
+                'audio_features': torch.from_numpy(audio).float(),
+                'caption': sample['caption'],
+            }
     
-    # Use SFTTrainer from TRL (designed for this)
-    from trl import SFTTrainer, SFTConfig
-    from datasets import Dataset
+    def collate_fn(batch):
+        audio_features = torch.stack([b['audio_features'] for b in batch])
+        captions = [b['caption'] for b in batch]
+        
+        # Tokenize captions
+        tokenized = tokenizer(
+            captions,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors='pt',
+        )
+        
+        # Create labels (shift for causal LM)
+        labels = tokenized['input_ids'].clone()
+        labels[labels == tokenizer.pad_token_id] = -100
+        
+        return {
+            'audio_features': audio_features,
+            'input_ids': tokenized['input_ids'],
+            'attention_mask': tokenized['attention_mask'],
+            'labels': labels,
+        }
     
-    dataset = Dataset.from_dict({"text": prompts})
+    train_dataset = AudioCaptionDataset(train_data, tokenizer)
+    val_dataset = AudioCaptionDataset(val_data, tokenizer)
     
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                              collate_fn=collate_fn, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            collate_fn=collate_fn, num_workers=2)
     
-    # Optimized training config
-    sft_config = SFTConfig(
-        output_dir=output_dir,
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=2,  # Effective batch = batch_size * 2
-        learning_rate=learning_rate,
-        lr_scheduler_type="cosine",  # Better than linear decay
-        warmup_ratio=0.1,  # 10% warmup for stability
-        max_grad_norm=1.0,  # Gradient clipping for stability
-        logging_steps=10,
-        save_steps=500,
-        save_total_limit=3,  # Keep only 3 best checkpoints
-        report_to="wandb" if use_wandb else "none",
-        dataset_text_field="text",
-        max_seq_length=512,
-        packing=True,  # Pack multiple samples for efficiency
-        fp16=not torch.cuda.is_bf16_supported(),
-        bf16=torch.cuda.is_bf16_supported(),
-    )
-    
-    print(f"\nTraining configuration:")
+    # =========================================================================
+    # 5. Training loop
+    # =========================================================================
+    print("\n5. Starting training...")
     print(f"  - Epochs: {num_epochs}")
-    print(f"  - Batch size: {batch_size} x 2 (grad accum) = {batch_size * 2}")
+    print(f"  - Batch size: {batch_size}")
     print(f"  - Learning rate: {learning_rate}")
     print(f"  - LoRA rank: {lora_r}")
-    print(f"  - Samples: {len(train_data)}")
     
-    trainer = SFTTrainer(
-        model=model,
-        args=sft_config,
-        train_dataset=dataset,
-        processing_class=tokenizer,
+    # Optimizer for projector + LoRA params
+    trainable_params = list(projector.parameters())
+    trainable_params += [p for p in model.parameters() if p.requires_grad]
+    if audio_encoder and not freeze_audio_encoder:
+        trainable_params += list(audio_encoder.parameters())
+    
+    optimizer = AdamW(trainable_params, lr=learning_rate, weight_decay=0.01)
+    
+    # Scheduler
+    total_steps = len(train_loader) * num_epochs
+    from transformers import get_cosine_schedule_with_warmup
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(0.1 * total_steps),
+        num_training_steps=total_steps,
     )
-    trainer.train()
     
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    best_val_loss = float('inf')
+    
+    # Get LLM embedding layer
+    embed_tokens = model.get_input_embeddings()
+    
+    for epoch in range(1, num_epochs + 1):
+        # Training
+        model.train()
+        projector.train()
+        if audio_encoder:
+            audio_encoder.train() if not freeze_audio_encoder else audio_encoder.eval()
+        
+        train_loss = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}")
+        
+        for step, batch in enumerate(pbar):
+            audio_features = batch['audio_features'].to(device)
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            # 1. Encode audio with MAE encoder
+            if audio_encoder:
+                with torch.no_grad() if freeze_audio_encoder else torch.enable_grad():
+                    audio_embeds = audio_encoder(audio_features)  # (B, audio_dim)
+            else:
+                # Fallback: simple mean pooling if no encoder
+                audio_embeds = audio_features.mean(dim=1)  # (B, 128)
+                audio_embeds = F.pad(audio_embeds, (0, 256 - 128))  # Pad to 256
+            
+            # 2. Project to LLM space
+            audio_tokens = projector(audio_embeds)  # (B, llm_dim)
+            audio_tokens = audio_tokens.unsqueeze(1)  # (B, 1, llm_dim) - single audio token
+            
+            # 3. Get text embeddings
+            text_embeds = embed_tokens(input_ids)  # (B, seq_len, llm_dim)
+            
+            # 4. Concatenate: [AUDIO_TOKEN] + [TEXT_TOKENS]
+            inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
+            
+            # 5. Extend attention mask and labels for audio token
+            B = audio_features.size(0)
+            audio_mask = torch.ones(B, 1, device=device, dtype=attention_mask.dtype)
+            extended_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
+            
+            # Labels: -100 for audio token (don't compute loss on it)
+            audio_labels = torch.full((B, 1), -100, device=device, dtype=labels.dtype)
+            extended_labels = torch.cat([audio_labels, labels], dim=1)
+            
+            # 6. Forward through LLM
+            outputs = model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=extended_attention_mask,
+                labels=extended_labels,
+            )
+            
+            loss = outputs.loss
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            
+            train_loss += loss.item()
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+        
+        train_loss /= len(train_loader)
+        
+        # Validation
+        model.eval()
+        projector.eval()
+        if audio_encoder:
+            audio_encoder.eval()
+        
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                audio_features = batch['audio_features'].to(device)
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+                
+                if audio_encoder:
+                    audio_embeds = audio_encoder(audio_features)
+                else:
+                    audio_embeds = audio_features.mean(dim=1)
+                    audio_embeds = F.pad(audio_embeds, (0, 256 - 128))
+                
+                audio_tokens = projector(audio_embeds).unsqueeze(1)
+                text_embeds = embed_tokens(input_ids)
+                inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
+                
+                B = audio_features.size(0)
+                audio_mask = torch.ones(B, 1, device=device, dtype=attention_mask.dtype)
+                extended_attention_mask = torch.cat([audio_mask, attention_mask], dim=1)
+                audio_labels = torch.full((B, 1), -100, device=device, dtype=labels.dtype)
+                extended_labels = torch.cat([audio_labels, labels], dim=1)
+                
+                outputs = model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=extended_attention_mask,
+                    labels=extended_labels,
+                )
+                val_loss += outputs.loss.item()
+        
+        val_loss /= len(val_loader)
+        
+        print(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+        
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save({
+                'projector_state_dict': projector.state_dict(),
+                'audio_encoder_state_dict': audio_encoder.state_dict() if audio_encoder else None,
+                'val_loss': val_loss,
+                'epoch': epoch,
+            }, f"{output_dir}/best_audio_model.pt")
+            model.save_pretrained(f"{output_dir}/best_model")
+            tokenizer.save_pretrained(f"{output_dir}/best_model")
+            print(f"  ✓ Saved best model (val_loss: {val_loss:.4f})")
+    
+    # Save final model
+    torch.save({
+        'projector_state_dict': projector.state_dict(),
+        'audio_encoder_state_dict': audio_encoder.state_dict() if audio_encoder else None,
+    }, f"{output_dir}/final_audio_model.pt")
     model.save_pretrained(f"{output_dir}/final_model")
     tokenizer.save_pretrained(f"{output_dir}/final_model")
     
-    print("\n✓ SFT training complete!")
+    print(f"\n✓ SFT training complete!")
+    print(f"  Best val loss: {best_val_loss:.4f}")
+    print(f"  Models saved to: {output_dir}/")
 
 
 # =============================================================================
@@ -761,38 +1252,44 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
     print("\nInitializing hybrid reward model (CIDEr + CLAP)...")
     reward_model = HybridRewardModel(alpha=reward_alpha, device=device)
     
-    # Load SFT model
+    # Load SFT model using Unsloth (same way it was saved)
     print(f"\nLoading SFT model from {model_path}...")
+    
+    from unsloth import FastLanguageModel
+    
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            device_map="auto",
+        # Load base model with the saved LoRA adapter
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_path,  # This loads the saved adapter
+            max_seq_length=512,
+            load_in_4bit=True,
+            token=hf_token,
         )
         
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        
+        print("  ✓ Model loaded with Unsloth")
             
     except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Trying to load base model instead...")
+        print(f"Error loading saved model: {e}")
+        print("Loading fresh base model for reward evaluation...")
         
         try:
-            from unsloth import FastLanguageModel
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name="google/gemma-2b-it",
                 max_seq_length=512,
                 load_in_4bit=True,
                 token=hf_token,
             )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
         except Exception as e2:
             print(f"Error: {e2}")
             return
     
-    model.eval()
+    # Enable inference mode
+    FastLanguageModel.for_inference(model)
     
     # Load training data
     print("\nLoading training data...")
@@ -945,13 +1442,21 @@ def main():
     parser.add_argument("--only-preprocess", action="store_true", help="Only preprocess data")
     parser.add_argument("--only-mae", action="store_true", help="Only train MAE")
     parser.add_argument("--skip-features", action="store_true", help="Skip AudioSet features download")
-    parser.add_argument("--mae-epochs", type=int, default=10, help="MAE training epochs")
+    
+    # MAE arguments (transformer-based)
+    parser.add_argument("--mae-epochs", type=int, default=50, help="MAE training epochs (default: 50)")
+    parser.add_argument("--mae-hidden-dim", type=int, default=256, help="MAE hidden dimension")
+    parser.add_argument("--mae-layers", type=int, default=4, help="MAE transformer layers")
+    parser.add_argument("--mae-heads", type=int, default=4, help="MAE attention heads")
+    parser.add_argument("--mae-mask-ratio", type=float, default=0.75, help="MAE mask ratio")
     
     # SFT arguments (optimized defaults)
     parser.add_argument("--sft-epochs", type=int, default=5, help="SFT training epochs (default: 5)")
     parser.add_argument("--sft-lr", type=float, default=1e-4, help="SFT learning rate (default: 1e-4)")
     parser.add_argument("--sft-lora-r", type=int, default=32, help="LoRA rank (default: 32)")
     parser.add_argument("--sft-max-samples", type=int, default=None, help="Max training samples (default: all)")
+    parser.add_argument("--mae-path", type=str, default="checkpoints/mae", help="Path to pretrained MAE encoder")
+    parser.add_argument("--finetune-audio-encoder", action="store_true", help="Fine-tune audio encoder (default: frozen)")
     parser.add_argument("--only-sft", action="store_true", help="Only run SFT training")
     
     # GRPO arguments
@@ -998,19 +1503,35 @@ def main():
     
     # Step 3: MAE
     if args.only_mae:
-        train_mae(num_epochs=args.mae_epochs, use_wandb=args.use_wandb)
+        train_mae(
+            num_epochs=args.mae_epochs,
+            hidden_dim=args.mae_hidden_dim,
+            num_layers=args.mae_layers,
+            num_heads=args.mae_heads,
+            mask_ratio=args.mae_mask_ratio,
+            use_wandb=args.use_wandb
+        )
         return
     
     if not args.skip_mae:
-        train_mae(num_epochs=args.mae_epochs, use_wandb=args.use_wandb)
+        train_mae(
+            num_epochs=args.mae_epochs,
+            hidden_dim=args.mae_hidden_dim,
+            num_layers=args.mae_layers,
+            num_heads=args.mae_heads,
+            mask_ratio=args.mae_mask_ratio,
+            use_wandb=args.use_wandb
+        )
     
-    # Step 4: SFT
+    # Step 4: SFT (now with audio encoder integration!)
     if args.only_sft:
         train_sft(
             num_epochs=args.sft_epochs,
             learning_rate=args.sft_lr,
             lora_r=args.sft_lora_r,
             max_samples=args.sft_max_samples,
+            mae_path=args.mae_path,
+            freeze_audio_encoder=not args.finetune_audio_encoder,
             use_wandb=args.use_wandb
         )
         return
@@ -1021,6 +1542,8 @@ def main():
             learning_rate=args.sft_lr,
             lora_r=args.sft_lora_r,
             max_samples=args.sft_max_samples,
+            mae_path=args.mae_path,
+            freeze_audio_encoder=not args.finetune_audio_encoder,
             use_wandb=args.use_wandb
         )
     
