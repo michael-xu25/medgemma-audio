@@ -23,6 +23,174 @@ import os
 import argparse
 
 # =============================================================================
+# SHARED MODEL CLASSES (used by MAE, SFT, and GRPO)
+# =============================================================================
+
+# These will be initialized after torch is imported
+TransformerMAE = None
+AudioProjector = None
+
+def _init_model_classes():
+    """Initialize model classes after torch is available."""
+    global TransformerMAE, AudioProjector
+    
+    if TransformerMAE is not None:
+        return  # Already initialized
+    
+    import torch
+    import torch.nn as nn
+    
+    class _TransformerMAE(nn.Module):
+        """
+        Transformer-based Masked Autoencoder for audio features.
+        
+        Architecture follows the original MAE paper:
+        - Encoder: Full transformer on visible patches only
+        - Decoder: Lightweight transformer for reconstruction
+        """
+        def __init__(self, input_dim=128, hidden_dim=256, num_layers=4, num_heads=4, 
+                     decoder_dim=128, decoder_layers=2, mask_ratio=0.75, max_len=64):
+            super().__init__()
+            self.input_dim = input_dim
+            self.hidden_dim = hidden_dim
+            self.mask_ratio = mask_ratio
+            
+            # Input projection
+            self.patch_embed = nn.Linear(input_dim, hidden_dim)
+            
+            # Positional embedding (learnable)
+            self.pos_embed = nn.Parameter(torch.randn(1, max_len, hidden_dim) * 0.02)
+            
+            # CLS token
+            self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            
+            # Transformer encoder
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim * 4,
+                dropout=0.1,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.encoder_norm = nn.LayerNorm(hidden_dim)
+            
+            # Decoder (lightweight)
+            self.decoder_embed = nn.Linear(hidden_dim, decoder_dim)
+            self.mask_token = nn.Parameter(torch.randn(1, 1, decoder_dim) * 0.02)
+            self.decoder_pos_embed = nn.Parameter(torch.randn(1, max_len, decoder_dim) * 0.02)
+            
+            decoder_layer = nn.TransformerEncoderLayer(
+                d_model=decoder_dim,
+                nhead=num_heads // 2 or 1,
+                dim_feedforward=decoder_dim * 4,
+                dropout=0.1,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_layers)
+            self.decoder_norm = nn.LayerNorm(decoder_dim)
+            
+            # Output projection
+            self.output_proj = nn.Linear(decoder_dim, input_dim)
+            
+            self._init_weights()
+        
+        def _init_weights(self):
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        
+        def random_masking(self, x):
+            """Random masking: keep (1-mask_ratio) patches."""
+            B, T, D = x.shape
+            num_keep = int(T * (1 - self.mask_ratio))
+            
+            noise = torch.rand(B, T, device=x.device)
+            ids_shuffle = torch.argsort(noise, dim=1)
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+            
+            ids_keep = ids_shuffle[:, :num_keep]
+            x_masked = torch.gather(x, 1, ids_keep.unsqueeze(-1).expand(-1, -1, D))
+            
+            mask = torch.ones(B, T, device=x.device)
+            mask[:, :num_keep] = 0
+            mask = torch.gather(mask, 1, ids_restore)
+            
+            return x_masked, mask, ids_restore, ids_keep
+        
+        def forward(self, x):
+            B, T, D = x.shape
+            
+            x = self.patch_embed(x)
+            x = x + self.pos_embed[:, :T, :]
+            
+            x_masked, mask, ids_restore, ids_keep = self.random_masking(x)
+            
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            x_masked = torch.cat([cls_tokens, x_masked], dim=1)
+            
+            x_encoded = self.encoder(x_masked)
+            x_encoded = self.encoder_norm(x_encoded)
+            
+            x_dec = self.decoder_embed(x_encoded)
+            x_dec = x_dec[:, 1:, :]
+            
+            mask_tokens = self.mask_token.expand(B, T - x_dec.size(1), -1)
+            x_full = torch.cat([x_dec, mask_tokens], dim=1)
+            x_full = torch.gather(x_full, 1, ids_restore.unsqueeze(-1).expand(-1, -1, x_full.size(-1)))
+            
+            x_full = x_full + self.decoder_pos_embed[:, :T, :]
+            
+            x_decoded = self.decoder(x_full)
+            x_decoded = self.decoder_norm(x_decoded)
+            
+            reconstruction = self.output_proj(x_decoded)
+            
+            return reconstruction, mask
+        
+        def compute_loss(self, x, reconstruction, mask):
+            """Compute MSE loss on masked patches only."""
+            loss = (reconstruction - x) ** 2
+            loss = loss.mean(dim=-1)
+            loss = (loss * mask).sum() / mask.sum()
+            return loss
+        
+        def get_encoder_output(self, x):
+            """Get encoder output for downstream tasks (CLS token)."""
+            B, T, D = x.shape
+            x = self.patch_embed(x)
+            x = x + self.pos_embed[:, :T, :]
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            x = torch.cat([cls_tokens, x], dim=1)
+            x = self.encoder(x)
+            x = self.encoder_norm(x)
+            return x[:, 0]  # Return CLS token
+    
+    class _AudioProjector(nn.Module):
+        """Projects audio embeddings to LLM embedding space."""
+        def __init__(self, audio_dim, llm_dim, hidden_dim=None):
+            super().__init__()
+            hidden_dim = hidden_dim or (audio_dim + llm_dim) // 2
+            self.proj = nn.Sequential(
+                nn.Linear(audio_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, llm_dim),
+                nn.LayerNorm(llm_dim),
+            )
+        
+        def forward(self, x):
+            return self.proj(x)
+    
+    TransformerMAE = _TransformerMAE
+    AudioProjector = _AudioProjector
+
+# =============================================================================
 # STEP 0: Install packages
 # =============================================================================
 
@@ -327,6 +495,10 @@ def train_mae(data_path="data/processed", output_dir="checkpoints/mae",
     from torch.utils.data import Dataset, DataLoader
     from torch.optim import AdamW
     from torch.optim.lr_scheduler import CosineAnnealingLR
+    
+    # Initialize global model classes
+    _init_model_classes()
+    global TransformerMAE
     from pathlib import Path
     from tqdm import tqdm
     import numpy as np
@@ -377,159 +549,7 @@ def train_mae(data_path="data/processed", output_dir="checkpoints/mae",
     train_loader = DataLoader(AudioDataset(train_data), batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(AudioDataset(val_data), batch_size=batch_size, num_workers=2)
     
-    # Transformer-based MAE model
-    class TransformerMAE(nn.Module):
-        """
-        Transformer-based Masked Autoencoder for audio features.
-        
-        Architecture follows the original MAE paper:
-        - Encoder: Full transformer on visible patches only
-        - Decoder: Lightweight transformer for reconstruction
-        """
-        def __init__(self, input_dim=128, hidden_dim=256, num_layers=4, num_heads=4, 
-                     decoder_dim=128, decoder_layers=2, mask_ratio=0.75, max_len=64):
-            super().__init__()
-            self.input_dim = input_dim
-            self.hidden_dim = hidden_dim
-            self.mask_ratio = mask_ratio
-            
-            # Input projection
-            self.patch_embed = nn.Linear(input_dim, hidden_dim)
-            
-            # Positional embedding (learnable)
-            self.pos_embed = nn.Parameter(torch.randn(1, max_len, hidden_dim) * 0.02)
-            
-            # CLS token
-            self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
-            
-            # Transformer encoder
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=num_heads,
-                dim_feedforward=hidden_dim * 4,
-                dropout=0.1,
-                activation='gelu',
-                batch_first=True,
-                norm_first=True,  # Pre-norm for stability
-            )
-            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-            self.encoder_norm = nn.LayerNorm(hidden_dim)
-            
-            # Decoder (lightweight)
-            self.decoder_embed = nn.Linear(hidden_dim, decoder_dim)
-            self.mask_token = nn.Parameter(torch.randn(1, 1, decoder_dim) * 0.02)
-            self.decoder_pos_embed = nn.Parameter(torch.randn(1, max_len, decoder_dim) * 0.02)
-            
-            decoder_layer = nn.TransformerEncoderLayer(
-                d_model=decoder_dim,
-                nhead=num_heads // 2 or 1,
-                dim_feedforward=decoder_dim * 4,
-                dropout=0.1,
-                activation='gelu',
-                batch_first=True,
-                norm_first=True,
-            )
-            self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_layers)
-            self.decoder_norm = nn.LayerNorm(decoder_dim)
-            
-            # Output projection
-            self.output_proj = nn.Linear(decoder_dim, input_dim)
-            
-            # Initialize weights
-            self._init_weights()
-        
-        def _init_weights(self):
-            # Initialize linear layers
-            for m in self.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-        
-        def random_masking(self, x):
-            """Random masking: keep (1-mask_ratio) patches."""
-            B, T, D = x.shape
-            num_keep = int(T * (1 - self.mask_ratio))
-            
-            # Random noise for shuffling
-            noise = torch.rand(B, T, device=x.device)
-            ids_shuffle = torch.argsort(noise, dim=1)
-            ids_restore = torch.argsort(ids_shuffle, dim=1)
-            
-            # Keep first num_keep
-            ids_keep = ids_shuffle[:, :num_keep]
-            x_masked = torch.gather(x, 1, ids_keep.unsqueeze(-1).expand(-1, -1, D))
-            
-            # Binary mask: 0 = keep, 1 = mask
-            mask = torch.ones(B, T, device=x.device)
-            mask[:, :num_keep] = 0
-            mask = torch.gather(mask, 1, ids_restore)
-            
-            return x_masked, mask, ids_restore, ids_keep
-        
-        def forward(self, x):
-            B, T, D = x.shape
-            
-            # Embed patches
-            x = self.patch_embed(x)
-            
-            # Add positional embedding
-            x = x + self.pos_embed[:, :T, :]
-            
-            # Masking
-            x_masked, mask, ids_restore, ids_keep = self.random_masking(x)
-            
-            # Add CLS token
-            cls_tokens = self.cls_token.expand(B, -1, -1)
-            x_masked = torch.cat([cls_tokens, x_masked], dim=1)
-            
-            # Encode (only visible patches)
-            x_encoded = self.encoder(x_masked)
-            x_encoded = self.encoder_norm(x_encoded)
-            
-            # Decode
-            # Project to decoder dimension
-            x_dec = self.decoder_embed(x_encoded)
-            
-            # Remove CLS, add mask tokens
-            x_dec = x_dec[:, 1:, :]  # Remove CLS
-            
-            # Unshuffle and add mask tokens
-            mask_tokens = self.mask_token.expand(B, T - x_dec.size(1), -1)
-            x_full = torch.cat([x_dec, mask_tokens], dim=1)
-            x_full = torch.gather(x_full, 1, ids_restore.unsqueeze(-1).expand(-1, -1, x_full.size(-1)))
-            
-            # Add decoder positional embedding
-            x_full = x_full + self.decoder_pos_embed[:, :T, :]
-            
-            # Decode
-            x_decoded = self.decoder(x_full)
-            x_decoded = self.decoder_norm(x_decoded)
-            
-            # Project to output
-            reconstruction = self.output_proj(x_decoded)
-            
-            return reconstruction, mask
-        
-        def compute_loss(self, x, reconstruction, mask):
-            """Compute MSE loss on masked patches only."""
-            loss = (reconstruction - x) ** 2
-            loss = loss.mean(dim=-1)  # Mean over features
-            loss = (loss * mask).sum() / mask.sum()  # Mean over masked patches
-            return loss
-        
-        def get_encoder_output(self, x):
-            """Get encoder output for downstream tasks."""
-            B, T, D = x.shape
-            x = self.patch_embed(x)
-            x = x + self.pos_embed[:, :T, :]
-            cls_tokens = self.cls_token.expand(B, -1, -1)
-            x = torch.cat([cls_tokens, x], dim=1)
-            x = self.encoder(x)
-            x = self.encoder_norm(x)
-            return x[:, 0]  # Return CLS token
-    
-    # Create model
+    # Create model (using global TransformerMAE class)
     model = TransformerMAE(
         input_dim=128,
         hidden_dim=hidden_dim,
@@ -688,24 +708,12 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
     from tqdm import tqdm
     import numpy as np
     
+    # Initialize global model classes
+    _init_model_classes()
+    global TransformerMAE, AudioProjector
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
-    # Audio projector: maps audio embeddings to LLM embedding space
-    class AudioProjector(nn.Module):
-        """Projects audio embeddings to LLM embedding space."""
-        def __init__(self, audio_dim, llm_dim, hidden_dim=None):
-            super().__init__()
-            hidden_dim = hidden_dim or (audio_dim + llm_dim) // 2
-            self.proj = nn.Sequential(
-                nn.Linear(audio_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, llm_dim),
-                nn.LayerNorm(llm_dim),
-            )
-        
-        def forward(self, x):
-            return self.proj(x)
     
     # Check for HuggingFace token
     hf_token = os.environ.get("HF_TOKEN")
@@ -1224,7 +1232,7 @@ class HybridRewardModel:
 def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_model",
                output_dir="checkpoints/grpo", num_steps=100, use_wandb=False,
                num_generations=4, reward_alpha=0.5, batch_size=2, learning_rate=5e-6,
-               mae_path="checkpoints/mae/best_mae.pt", projector_path="checkpoints/sft/projector.pt"):
+               mae_path="checkpoints/mae", projector_path="checkpoints/sft/projector.pt"):
     """
     Train GRPO for improved caption quality using hybrid reward model.
     
@@ -1246,6 +1254,10 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
     import numpy as np
     from pathlib import Path
     from tqdm import tqdm
+    
+    # Initialize global model classes
+    _init_model_classes()
+    global TransformerMAE, AudioProjector
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -1271,16 +1283,24 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
     print("\n2. Loading MAE encoder...")
     
     mae_encoder = None
-    if os.path.exists(mae_path):
+    mae_checkpoint = Path(mae_path) / "best_model.pt"
+    if not mae_checkpoint.exists():
+        mae_checkpoint = Path(mae_path) / "final_model.pt"
+    
+    if mae_checkpoint.exists():
         mae_encoder = TransformerMAE(
             input_dim=128, hidden_dim=256, num_layers=4, 
-            num_heads=4, mask_ratio=0.0, target_length=10  # No masking during inference
+            num_heads=4, mask_ratio=0.0  # No masking during inference
         ).to(device)
-        mae_encoder.load_state_dict(torch.load(mae_path, map_location=device))
+        
+        # Load checkpoint
+        checkpoint = torch.load(mae_checkpoint, map_location=device)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        mae_encoder.load_state_dict(state_dict)
         mae_encoder.eval()
         for p in mae_encoder.parameters():
             p.requires_grad = False
-        print(f"  ✓ MAE encoder loaded from {mae_path}")
+        print(f"  ✓ MAE encoder loaded from {mae_checkpoint}")
     else:
         print(f"  ⚠ MAE encoder not found at {mae_path}, will use text-only mode")
     
@@ -1387,13 +1407,8 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/final_mod
         audio_tensor = torch.from_numpy(audio_features).float().unsqueeze(0).to(device)
         
         with torch.no_grad():
-            # Get CLS token from MAE encoder
-            encoded = mae_encoder.patch_embedding(audio_tensor)
-            cls_token = mae_encoder.cls_token.expand(1, -1, -1)
-            encoded = torch.cat([cls_token, encoded], dim=1)
-            encoded = encoded + mae_encoder.positional_embedding[:, :encoded.size(1), :]
-            encoded = mae_encoder.encoder(encoded)
-            audio_embedding = encoded[:, 0, :]  # CLS token
+            # Get CLS token from MAE encoder using built-in method
+            audio_embedding = mae_encoder.get_encoder_output(audio_tensor)
             
             # Project to LLM dimension
             audio_projected = projector(audio_embedding.unsqueeze(1))
