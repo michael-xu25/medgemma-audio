@@ -443,8 +443,19 @@ def train_mae(data_path="data/processed", output_dir="checkpoints/mae",
 # =============================================================================
 
 def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
-              model_name="google/gemma-2b-it", batch_size=4, num_epochs=3, use_wandb=False):
-    """Train SFT for audio captioning."""
+              model_name="google/gemma-2b-it", batch_size=4, num_epochs=5, use_wandb=False,
+              lora_r=32, lora_alpha=64, learning_rate=1e-4, max_samples=None):
+    """
+    Train SFT for audio captioning with optimized settings.
+    
+    Optimizations applied:
+    - LoRA r=32 (more capacity than r=16)
+    - LoRA dropout=0 (faster training, Unsloth recommended)
+    - Learning rate=1e-4 (more conservative)
+    - Gradient clipping at 1.0
+    - Warmup ratio 10%
+    - Uses ALL available training data by default
+    """
     print("\n" + "=" * 60)
     print("Training SFT (Supervised Fine-Tuning)...")
     print("=" * 60 + "\n")
@@ -478,22 +489,39 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
         token=hf_token,
     )
     
+    # Optimized LoRA settings
+    print(f"Applying LoRA with r={lora_r}, alpha={lora_alpha}, dropout=0...")
     model = FastLanguageModel.get_peft_model(
         model,
-        r=16,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_alpha=16,
-        lora_dropout=0.05,
+        r=lora_r,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=lora_alpha,
+        lora_dropout=0,  # Unsloth recommends 0 for faster training
+        use_gradient_checkpointing="unsloth",  # Memory optimization
     )
     
     # Load data
     with open(Path(data_path) / "train.pkl", 'rb') as f:
         train_data = pickle.load(f)
     
-    # Format prompts
+    # Use all data or limit if specified
+    if max_samples is not None and max_samples < len(train_data):
+        train_data = train_data[:max_samples]
+        print(f"Using {max_samples} samples (limited)")
+    else:
+        print(f"Using ALL {len(train_data)} training samples")
+    
+    # Format prompts with richer context
     prompts = []
-    for sample in train_data[:1000]:  # Limit for demo
-        prompt = f"<start_of_turn>user\nDescribe this audio.<end_of_turn>\n<start_of_turn>model\n{sample['caption']}<end_of_turn>"
+    for sample in train_data:
+        prompt = f"""<start_of_turn>user
+Listen to this audio clip and provide a detailed description of what you hear. Include information about:
+- The main sounds or events
+- Any background noises
+- The overall atmosphere or mood
+<end_of_turn>
+<start_of_turn>model
+{sample['caption']}<end_of_turn>"""
         prompts.append(prompt)
     
     # Use SFTTrainer from TRL (designed for this)
@@ -504,18 +532,33 @@ def train_sft(data_path="data/processed", output_dir="checkpoints/sft",
     
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
+    # Optimized training config
     sft_config = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
-        learning_rate=2e-4,
+        gradient_accumulation_steps=2,  # Effective batch = batch_size * 2
+        learning_rate=learning_rate,
+        lr_scheduler_type="cosine",  # Better than linear decay
+        warmup_ratio=0.1,  # 10% warmup for stability
+        max_grad_norm=1.0,  # Gradient clipping for stability
         logging_steps=10,
         save_steps=500,
-        report_to="none",
+        save_total_limit=3,  # Keep only 3 best checkpoints
+        report_to="wandb" if use_wandb else "none",
         dataset_text_field="text",
         max_seq_length=512,
-        packing=False,
+        packing=True,  # Pack multiple samples for efficiency
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
     )
+    
+    print(f"\nTraining configuration:")
+    print(f"  - Epochs: {num_epochs}")
+    print(f"  - Batch size: {batch_size} x 2 (grad accum) = {batch_size * 2}")
+    print(f"  - Learning rate: {learning_rate}")
+    print(f"  - LoRA rank: {lora_r}")
+    print(f"  - Samples: {len(train_data)}")
     
     trainer = SFTTrainer(
         model=model,
@@ -903,12 +946,21 @@ def main():
     parser.add_argument("--only-mae", action="store_true", help="Only train MAE")
     parser.add_argument("--skip-features", action="store_true", help="Skip AudioSet features download")
     parser.add_argument("--mae-epochs", type=int, default=10, help="MAE training epochs")
-    parser.add_argument("--sft-epochs", type=int, default=3, help="SFT training epochs")
+    
+    # SFT arguments (optimized defaults)
+    parser.add_argument("--sft-epochs", type=int, default=5, help="SFT training epochs (default: 5)")
+    parser.add_argument("--sft-lr", type=float, default=1e-4, help="SFT learning rate (default: 1e-4)")
+    parser.add_argument("--sft-lora-r", type=int, default=32, help="LoRA rank (default: 32)")
+    parser.add_argument("--sft-max-samples", type=int, default=None, help="Max training samples (default: all)")
+    parser.add_argument("--only-sft", action="store_true", help="Only run SFT training")
+    
+    # GRPO arguments
     parser.add_argument("--grpo-steps", type=int, default=100, help="GRPO training steps")
     parser.add_argument("--grpo-alpha", type=float, default=0.5, help="GRPO reward alpha (CIDEr weight)")
     parser.add_argument("--grpo-generations", type=int, default=4, help="Generations per sample in GRPO")
-    parser.add_argument("--use-wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--only-grpo", action="store_true", help="Only run GRPO training")
+    
+    parser.add_argument("--use-wandb", action="store_true", help="Enable W&B logging")
     
     args = parser.parse_args()
     
@@ -953,8 +1005,24 @@ def main():
         train_mae(num_epochs=args.mae_epochs, use_wandb=args.use_wandb)
     
     # Step 4: SFT
+    if args.only_sft:
+        train_sft(
+            num_epochs=args.sft_epochs,
+            learning_rate=args.sft_lr,
+            lora_r=args.sft_lora_r,
+            max_samples=args.sft_max_samples,
+            use_wandb=args.use_wandb
+        )
+        return
+    
     if not args.skip_sft:
-        train_sft(num_epochs=args.sft_epochs, use_wandb=args.use_wandb)
+        train_sft(
+            num_epochs=args.sft_epochs,
+            learning_rate=args.sft_lr,
+            lora_r=args.sft_lora_r,
+            max_samples=args.sft_max_samples,
+            use_wandb=args.use_wandb
+        )
     
     # Step 5: GRPO
     if args.only_grpo:
