@@ -1470,41 +1470,29 @@ def train_grpo(data_path="data/processed", model_path="checkpoints/sft/best_mode
         all_references = []
         all_log_probs = []
         
-        # Custom autoregressive generation with audio embeddings
+        # Custom autoregressive generation with audio embeddings (no KV cache for compatibility)
         def generate_with_audio(audio_tokens, prompt_ids, max_new_tokens=64, temperature=0.8, top_p=0.9):
             """Generate text autoregressively with audio tokens prepended."""
             model.eval()
             embed_tokens = model.get_input_embeddings()
             
-            # Get initial embeddings
-            text_embeds = embed_tokens(prompt_ids)  # (1, seq_len, llm_dim)
-            
-            if audio_tokens is not None:
-                # Concatenate: [AUDIO_TOKENS] + [TEXT_TOKENS]
-                inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
-                num_audio_toks = audio_tokens.size(1)
-            else:
-                inputs_embeds = text_embeds
-                num_audio_toks = 0
-            
             # Track generated token ids
             generated_ids = prompt_ids.clone()
+            num_audio_toks = audio_tokens.size(1) if audio_tokens is not None else 0
             
-            # Autoregressive generation loop
-            past_key_values = None
+            # Autoregressive generation loop (without KV cache for Unsloth compatibility)
             for _ in range(max_new_tokens):
                 with torch.no_grad():
-                    if past_key_values is None:
-                        # First forward pass with full inputs_embeds
-                        outputs = model(inputs_embeds=inputs_embeds, use_cache=True)
-                        past_key_values = outputs.past_key_values
+                    # Build full inputs_embeds each time
+                    text_embeds = embed_tokens(generated_ids)
+                    
+                    if audio_tokens is not None:
+                        inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)
                     else:
-                        # Subsequent passes: only pass the last generated token
-                        last_token_embed = embed_tokens(generated_ids[:, -1:])
-                        outputs = model(inputs_embeds=last_token_embed, 
-                                       past_key_values=past_key_values, 
-                                       use_cache=True)
-                        past_key_values = outputs.past_key_values
+                        inputs_embeds = text_embeds
+                    
+                    # Forward pass
+                    outputs = model(inputs_embeds=inputs_embeds)
                     
                     # Get logits for the last position
                     logits = outputs.logits[:, -1, :] / temperature
